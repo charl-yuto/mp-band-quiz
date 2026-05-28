@@ -1,0 +1,15 @@
+{
+  "scripts": {
+    "dev": "node ./node_modules/vite/bin/vite.js --host 127.0.0.1 --port 5173",
+    "build": "node ./node_modules/vite/bin/vite.js build",
+    "preview": "node ./node_modules/vite/bin/vite.js preview"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "6.0.2",
+    "vite": "8.0.14",
+    "react": "19.2.6",
+    "react-dom": "19.2.6",
+    "plotly.js-dist-min": "3.5.1",
+    "react-plotly.js": "2.6.0"
+  }
+}

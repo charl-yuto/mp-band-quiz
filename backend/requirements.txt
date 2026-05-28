@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+mp-api
+pymatgen
+numpy
+scipy
+pydantic

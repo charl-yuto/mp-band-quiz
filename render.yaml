@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: mp-band-quiz
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: MP_API_KEY
+        sync: false
