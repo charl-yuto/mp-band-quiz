@@ -17,13 +17,16 @@ const DEFAULT_SETTINGS = {
   selected_orbitals: ['s', 'p', 'd', 'f'],
   exclude_f_block: false,
   exclude_missing_f_dos: true,
-  random_strategy: 'balanced_live',
+  random_strategy: 'fast_pool',
   random_element_search: true,
-  random_element_seed_count: 6,
+  random_element_seed_count: 4,
   random_mpid_min: 1,
   random_mpid_max: 2000000,
-  random_mpid_batch_size: 900,
-  random_mpid_rounds: 5,
+  random_mpid_batch_size: 300,
+  random_mpid_rounds: 1,
+  fast_pool_target: 180,
+  fast_pool_refill_rounds: 1,
+  parallel_fetch: true,
   prefer_cache: false,
   cache_only: false,
   save_cache: false,
@@ -31,9 +34,9 @@ const DEFAULT_SETTINGS = {
   require_band_dos_props: true,
   use_candidate_cache: false,
   refresh_candidate_pool: true,
-  candidate_pool_size: 180,
+  candidate_pool_size: 100,
   candidate_num_chunks: 1,
-  max_trials: 36,
+  max_trials: 12,
   avoid_recent: true,
   recent_limit: 1000,
   energy_min: -12,
@@ -64,6 +67,11 @@ const DEFAULT_VIEW = {
 
 function normalizeAnswer(s) {
   return String(s || '').trim().replace(/\s+/g, '').replace(/[０-９]/g, d => String.fromCharCode(d.charCodeAt(0) - 0xfee0)).toLowerCase()
+}
+
+function prettyAnonFormula(formula) {
+  const f = String(formula || '-')
+  return f.replace(/([A-Z])(\d+)/g, (_, a, n) => a + n.split('').map(d => '₀₁₂₃₄₅₆₇₈₉'[Number(d)] || d).join(''))
 }
 
 async function apiPost(path, body) {
@@ -340,9 +348,9 @@ export default function App() {
   return <div className="app">
     <header className="topbar">
       <div>
-        <span className="badge">MP Band Quiz v15</span>
+        <span className="badge">MP Band Quiz v16 Fast</span>
         <h1>バンド図・DOS クイズ</h1>
-        <p>MP の実データを使い、匿名組成式・結晶情報・band/DOS から物質を当てます。v8の可動UIを維持しつつ、バランス乱数・軌道選択・検索出題・デプロイ対応を入れています。</p>
+        <p>MP の実データを使い、band/DOS・結晶情報から物質を当てます。UI は v8 系の可動表示を維持し、URL版での出題エラー低減と高速候補プールを強化しています。</p>
       </div>
       <div className="topActions">
         <button className="primary" onClick={() => newQuiz(false)} disabled={loading}>{loading ? '取得中...' : 'ランダム出題'}</button>
@@ -356,12 +364,13 @@ export default function App() {
       <section className="leftPane">
         <div className="card answerCard">
           <SectionTitle title="回答" subtitle="答えは元素記号または化学式で入力できます。" />
-          {hint ? <div className="hintBox">
-            <div><span>匿名組成式</span><b>{hint.anonymous_formula}</b></div>
+          {hint ? <div className="hintBox hintBoxBetter">
+            <div><span>構成比</span><b>{prettyAnonFormula(hint.anonymous_formula)}</b></div>
+            <div><span>元素数</span><b>{hint.nelements ?? '-'}</b></div>
             <div><span>結晶系</span><b>{hint.crystal_system || '-'}</b></div>
             <div><span>空間群</span><b>{hint.spacegroup_symbol || '-'} No. {hint.spacegroup_number || '-'}</b></div>
-            <div><span>サイト数</span><b>{hint.nsites ?? '-'}</b></div>
-            <div><span>性質</span><b>{hint.is_metal ? 'metal' : 'nonmetal'}</b></div>
+            <div><span>単位胞サイト数</span><b>{hint.nsites ?? '-'}</b></div>
+            <div><span>電子状態</span><b>{hint.is_metal ? 'metal' : `gap ${Number(hint.band_gap ?? 0).toFixed(2)} eV`}</b></div>
           </div> : <div className="hintBox blank">まだ出題されていません。</div>}
           <div className="answerRow"><input value={answer} onChange={e=>{setAnswer(e.target.value); setResult(null)}} onKeyDown={e=>{if(e.key==='Enter') check()}} placeholder="例: Cr, Si, H2O" /><button onClick={check} disabled={!quiz}>回答</button></div>
           <div className="answerTools"><button onClick={reveal} disabled={!quiz}>答え表示</button><button onClick={() => {setAnswer(''); setResult(null); setRevealed(null)}} disabled={!quiz}>もう一度</button></div>
@@ -385,16 +394,17 @@ export default function App() {
           <div className="switchRow"><Toggle label="希土類・アクチノイド除外" checked={settings.exclude_f_block} onChange={v=>setS('exclude_f_block', v)} /><Toggle label="f-DOS欠損を除外" checked={settings.exclude_missing_f_dos} onChange={v=>setS('exclude_missing_f_dos', v)} help="Dy等でfが出ない問題を避ける" /></div>
         </SettingsCard>
 
-        <SettingsCard title="検索高速化" desc="問題の丸ごとキャッシュや事前取得は使わず、MP検索そのものを軽くします。">
-          <Field label="ランダム方式"><Select value={settings.random_strategy} onChange={v=>setS('random_strategy', v)} options={[{value:'balanced_live',label:'バランス乱数（推奨）'},{value:'mpid_batch',label:'mp-id乱数のみ'},{value:'hybrid',label:'mp-id乱数→元素検索'},{value:'element_seed',label:'元素検索（旧方式）'}]} /></Field>
+        <SettingsCard title="検索高速化" desc="完全な問題キャッシュは使わず、候補IDだけを短時間メモリ保持して高速化します。初回だけ少し遅く、2問目以降は速くなります。">
+          <Field label="ランダム方式"><Select value={settings.random_strategy} onChange={v=>setS('random_strategy', v)} options={[{value:'fast_pool',label:'高速候補プール（推奨）'},{value:'balanced_live',label:'完全ライブ混合（遅め）'},{value:'mpid_batch',label:'mp-id乱数のみ'},{value:'hybrid',label:'mp-id乱数→元素検索'},{value:'element_seed',label:'元素検索（旧方式）'}]} /></Field>
           <Toggle label="band/DOSがある候補に絞る" checked={settings.require_band_dos_props} onChange={v=>setS('require_band_dos_props', v)} help="失敗候補を減らす。通常ON推奨" />
           <Toggle label="最近出た物質を避ける" checked={settings.avoid_recent} onChange={v=>setS('avoid_recent', v)} help="同じmp-idの連続出題を避ける" />
-          <Toggle label="候補リストを保存" checked={settings.use_candidate_cache} onChange={v=>setS('use_candidate_cache', v)} help="ランダム性重視ならOFF推奨" />
+          <Toggle label="band/DOSを並列取得" checked={settings.parallel_fetch} onChange={v=>setS('parallel_fetch', v)} help="高速化。通常ON推奨" />
+          <div className="grid2"><Field label="候補IDプール数" note="IDだけをメモリ保持。問題キャッシュではありません。"><NumberInput value={settings.fast_pool_target} onChange={v=>setS('fast_pool_target',v)} min={80}/></Field><Field label="候補探索回数"><NumberInput value={settings.fast_pool_refill_rounds} onChange={v=>setS('fast_pool_refill_rounds',v)} min={1} max={8}/></Field></div>
           <div className="grid2"><Field label="mp-id最小"><NumberInput value={settings.random_mpid_min} onChange={v=>setS('random_mpid_min',v)} min={1}/></Field><Field label="mp-id最大"><NumberInput value={settings.random_mpid_max} onChange={v=>setS('random_mpid_max',v)} min={1000}/></Field></div>
           <div className="grid2"><Field label="mp-idバッチ数"><NumberInput value={settings.random_mpid_batch_size} onChange={v=>setS('random_mpid_batch_size',v)} min={40}/></Field><Field label="mp-idラウンド数"><NumberInput value={settings.random_mpid_rounds} onChange={v=>setS('random_mpid_rounds',v)} min={1} max={20}/></Field></div>
-          <div className="grid2"><Field label="試行数"><NumberInput value={settings.max_trials} onChange={v=>setS('max_trials',v)} min={1}/></Field><Field label="最近回避数"><NumberInput value={settings.recent_limit} onChange={v=>setS('recent_limit',v)} min={10}/></Field></div>
-          <details className="advanced"><summary>旧方式: 元素シード検索</summary><Toggle label="複数ランダム元素で探す" checked={settings.random_element_search} onChange={v=>setS('random_element_search', v)} /><Field label="元素シード数"><NumberInput value={settings.random_element_seed_count} onChange={v=>setS('random_element_seed_count',v)} min={1} max={16}/></Field><div className="grid2"><Field label="候補数"><NumberInput value={settings.candidate_pool_size} onChange={v=>setS('candidate_pool_size',v)} min={20}/></Field><Field label="候補チャンク数"><NumberInput value={settings.candidate_num_chunks} onChange={v=>setS('candidate_num_chunks',v)} min={1} max={20}/></Field></div></details>
-          <p className="smallNote">通常は「バランス乱数（推奨）」を使ってください。mp-id乱数と複数元素検索を混ぜ、候補保存に頼らず偏りを抑えます。</p>
+          <div className="grid2"><Field label="試行数" note="多いほど出題失敗しにくいが遅くなります。"><NumberInput value={settings.max_trials} onChange={v=>setS('max_trials',v)} min={1}/></Field><Field label="最近回避数"><NumberInput value={settings.recent_limit} onChange={v=>setS('recent_limit',v)} min={10}/></Field></div>
+          <details className="advanced"><summary>詳細: 元素シード検索・候補ID保存</summary><Toggle label="複数ランダム元素で探す" checked={settings.random_element_search} onChange={v=>setS('random_element_search', v)} /><Field label="元素シード数"><NumberInput value={settings.random_element_seed_count} onChange={v=>setS('random_element_seed_count',v)} min={1} max={16}/></Field><div className="grid2"><Field label="候補数"><NumberInput value={settings.candidate_pool_size} onChange={v=>setS('candidate_pool_size',v)} min={20}/></Field><Field label="候補チャンク数"><NumberInput value={settings.candidate_num_chunks} onChange={v=>setS('candidate_num_chunks',v)} min={1} max={20}/></Field></div><Toggle label="候補IDをファイル保存" checked={settings.use_candidate_cache} onChange={v=>setS('use_candidate_cache', v)} help="Renderでは永続しにくいので通常OFF" /></details>
+          <p className="smallNote">推奨は「高速候補プール」です。完全な問題キャッシュは使わず、mp-id候補だけをメモリ保持します。URL版では初回のMP検索だけ遅く、2問目以降は候補探索が軽くなります。</p>
         </SettingsCard>
       </section>
 

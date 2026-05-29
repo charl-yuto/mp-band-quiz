@@ -1,55 +1,40 @@
-# MP Band Quiz v15 deploy guide
+# Deploy guide: MP Band Quiz v16 Speed
 
-この版は frontend を build して FastAPI が同じ URL で配信します。Render/Fly.io/VPS/Docker で公開できます。
+## Render に更新する場合
 
-## 推奨: Render + GitHub
+1. 既存の GitHub repository の中身をこの v16 Speed の中身で置き換えます。
+2. commit/push します。
+3. Render の Auto Deploy が ON なら自動で再ビルドされます。
 
-1. GitHub にこの `mp_band_quiz_real_v15` フォルダの中身を push します。
-2. Render で New Web Service を作り、その GitHub repository を選びます。
-3. Runtime は Docker を選びます。`Dockerfile` が自動利用されます。
-4. Environment Variables に次を追加します。
+```bash
+cd path/to/mp-band-quiz
+# 必要なら既存ファイルをバックアップしてから v16 の中身をコピー
+git add .
+git commit -m "Update to v16 speed random mode"
+git push
+```
+
+## Render の環境変数
+
+Render の Environment Variables に必ず設定します。
 
 ```text
 MP_API_KEY = あなたの Materials Project API key
 ```
 
-5. Deploy します。以後は GitHub に push すれば自動更新できます。
+## Dockerfile
 
-`render.yaml` も入れてあるので、Blueprint として使うこともできます。
+Render では Dockerfile を使う想定です。Build Command / Start Command は空欄で構いません。Dockerfile の CMD が Render の `$PORT` に bind します。
 
-## Fly.io
+## 速度について
 
-```bash
-fly launch
-fly secrets set MP_API_KEY='your_api_key'
-fly deploy
-```
+この版は full quiz cache をデフォルトでは使いません。代わりに、候補 mp-id だけをメモリに保持します。
 
-Dockerfile から deploy できます。
+- 同じ問題ばかり出るリスク: full cache より低い
+- 速度: 完全ライブ検索より速い
+- 初回: MP API summary search のため遅いことがあります
+- 2問目以降: service が起動している限り候補IDプールにより速くなります
 
-## ローカルで Docker 起動
+## Render Free の注意
 
-```bash
-docker build -t mp-band-quiz .
-docker run --rm -p 8000:8000 -e MP_API_KEY='your_api_key' mp-band-quiz
-```
-
-ブラウザ: http://127.0.0.1:8000/
-
-## 一時公開だけなら Cloudflare Quick Tunnel
-
-```bash
-export MP_API_KEY='your_api_key'
-PORT=8010 ./run_public_cloudflare.sh
-```
-
-これはターミナルを閉じると止まります。常時公開は Render/Fly.io 等へ deploy してください。
-
-## v15 の設計メモ
-
-- v8 系の Plotly 可動 UI を維持。
-- 正解時に簡易 confetti effect。
-- デフォルトエネルギー範囲は `-12 eV` から `+12 eV`。
-- デフォルトランダム方式は `balanced_live`。
-- `balanced_live` は mp-id 乱数とランダム元素検索を毎回混ぜ、候補を重複除去してシャッフルします。
-- 「候補を再検索」ボタンは廃止しました。
+Render Free では sleep/cold start があります。また、file cache は永続化しません。常時高速化したい場合は、Render 有料インスタンス、Redis/Postgres、または外部DBによる候補ID index 化が必要です。

@@ -8,6 +8,7 @@ import re
 import time
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -39,6 +40,12 @@ CANDIDATE_CACHE_DIR = CACHE_DIR / "candidate_pools"
 CACHE_INDEX = CACHE_DIR / "index.json"
 RECENT_HISTORY = CACHE_DIR / "recent_history.json"
 
+# In-memory candidate ID pools. These are not full quiz caches; they only store
+# material IDs that matched inexpensive summary-level filters.  Render keeps
+# this memory while the service is alive, so subsequent random questions avoid
+# repeating slow MP summary searches while still fetching fresh band/DOS data.
+MEMORY_CANDIDATE_POOLS: Dict[str, List[str]] = {}
+
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 QUIZ_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CANDIDATE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -48,7 +55,7 @@ CANDIDATE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 # FastAPI setup
 # ============================================================
 
-app = FastAPI(title="MP Band Quiz", version="15.0")
+app = FastAPI(title="MP Band Quiz", version="16.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -101,13 +108,20 @@ class QuizSettings(BaseModel):
     #               This avoids element bias such as As/V/Cr appearing too often.
     #   element_seed: query by random element seeds. Faster sometimes, but biased.
     #   hybrid: try mpid_batch first, then element_seed fallback.
-    random_strategy: str = "balanced_live"
+    random_strategy: str = "fast_pool"
     random_element_search: bool = True
     random_element_seed_count: int = 6
     random_mpid_min: int = 1
     random_mpid_max: int = 2000000
-    random_mpid_batch_size: int = 900
-    random_mpid_rounds: int = 5
+    random_mpid_batch_size: int = 500
+    random_mpid_rounds: int = 2
+
+    # Fast random mode.  It caches only candidate mp-ids in memory, not full
+    # band/DOS payloads, so the output remains much less repetitive than full
+    # quiz cache while avoiding slow repeated summary searches.
+    fast_pool_target: int = 500
+    fast_pool_refill_rounds: int = 2
+    parallel_fetch: bool = True
 
     # Speed / randomization
     # v8 default is LIVE RANDOM: do not reuse full quiz cache and do not prefetch.
@@ -127,9 +141,9 @@ class QuizSettings(BaseModel):
     # better randomness; turn ON only if the summary search itself is too slow.
     use_candidate_cache: bool = False
     refresh_candidate_pool: bool = True
-    candidate_pool_size: int = 180
+    candidate_pool_size: int = 220
     candidate_num_chunks: int = 1
-    max_trials: int = 36
+    max_trials: int = 18
 
     # Avoid repeating recently shown materials.
     avoid_recent: bool = True
@@ -333,11 +347,13 @@ def settings_candidate_key(settings: QuizSettings) -> str:
         "exclude_f_block": settings.exclude_f_block,
         "exclude_missing_f_dos": settings.exclude_missing_f_dos,
         "random_strategy": settings.random_strategy,
+        "selected_orbitals": sorted([str(x) for x in (settings.selected_orbitals or [])]),
         "random_element_seed_count": settings.random_element_seed_count,
         "random_mpid_min": settings.random_mpid_min,
         "random_mpid_max": settings.random_mpid_max,
         "random_mpid_batch_size": settings.random_mpid_batch_size,
         "random_mpid_rounds": settings.random_mpid_rounds,
+        "fast_pool_target": settings.fast_pool_target,
     }
     raw = json.dumps(key, sort_keys=True, ensure_ascii=False)
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw)[:160]
@@ -877,6 +893,42 @@ def _random_material_id_batch(rng: secrets.SystemRandom, settings: QuizSettings,
     return list(ids)
 
 
+
+
+def _memory_pool_key(settings: QuizSettings) -> str:
+    """Key for in-memory candidate ID pools.
+
+    This intentionally keys only by filters that affect candidate validity.
+    It does not key by display-only settings such as energy range.
+    """
+    return settings_candidate_key(settings)
+
+
+def _take_from_memory_pool(settings: QuizSettings, count: int) -> List[str]:
+    key = _memory_pool_key(settings)
+    pool = MEMORY_CANDIDATE_POOLS.get(key, [])
+    if not pool:
+        return []
+    if settings.avoid_recent:
+        recent = set(load_recent_history()[: max(1, int(settings.recent_limit))])
+        pool = [x for x in pool if x not in recent]
+    rng = secrets.SystemRandom()
+    rng.shuffle(pool)
+    chosen = pool[: max(1, int(count))]
+    remaining = [x for x in pool if x not in set(chosen)]
+    MEMORY_CANDIDATE_POOLS[key] = remaining
+    return chosen
+
+
+def _add_to_memory_pool(settings: QuizSettings, ids: List[str], limit: Optional[int] = None) -> None:
+    key = _memory_pool_key(settings)
+    current = MEMORY_CANDIDATE_POOLS.get(key, [])
+    merged = list(dict.fromkeys([str(x) for x in current + list(ids) if str(x)]))
+    secrets.SystemRandom().shuffle(merged)
+    if limit is None:
+        limit = max(200, int(settings.fast_pool_target) * 3)
+    MEMORY_CANDIDATE_POOLS[key] = merged[: int(limit)]
+
 def search_candidates_by_random_mpid(mpr: MPRester, settings: QuizSettings) -> List[str]:
     """Candidate search with much less element bias.
 
@@ -1015,6 +1067,57 @@ def search_candidates_by_element_seed(mpr: MPRester, settings: QuizSettings) -> 
 
 
 
+
+
+def search_candidates_fast_pool(mpr: MPRester, settings: QuizSettings) -> List[str]:
+    """Fast random candidate search.
+
+    The previous fully-live random search repeated expensive MP summary queries
+    on every question.  This function keeps a large in-memory pool of candidate
+    mp-ids for the current filters.  It does NOT cache complete quizzes, band
+    structures, DOS, answers, or structures.  Each selected mp-id still fetches
+    fresh band/DOS data, but candidate discovery becomes much faster after the
+    first refill.
+    """
+    requested = max(20, int(settings.max_trials) * 4)
+    from_pool = _take_from_memory_pool(settings, requested)
+    if len(from_pool) >= max(8, int(settings.max_trials)):
+        return choose_candidate_order(from_pool, settings)
+
+    ids: List[str] = list(from_pool)
+    target = max(80, int(settings.fast_pool_target))
+    refill_rounds = max(1, min(int(settings.fast_pool_refill_rounds), 8))
+
+    # Refill with mp-id random first to avoid element bias.  If strict filters
+    # produce too few valid docs, enrich with element-seeded search.
+    for _ in range(refill_rounds):
+        try:
+            st = settings.model_copy(deep=True)
+            st.use_candidate_cache = False
+            st.refresh_candidate_pool = True
+            st.random_mpid_rounds = max(1, min(int(settings.random_mpid_rounds), 4))
+            st.random_mpid_batch_size = max(120, min(int(settings.random_mpid_batch_size), 1200))
+            ids.extend(search_candidates_by_random_mpid(mpr, st))
+        except Exception:
+            pass
+        if len(set(ids)) >= target:
+            break
+        try:
+            st = settings.model_copy(deep=True)
+            st.use_candidate_cache = False
+            st.refresh_candidate_pool = True
+            st.random_element_seed_count = max(3, min(int(settings.random_element_seed_count), 10))
+            st.candidate_pool_size = max(60, min(int(settings.candidate_pool_size), 250))
+            ids.extend(search_candidates_by_element_seed(mpr, st))
+        except Exception:
+            pass
+        if len(set(ids)) >= target:
+            break
+
+    ids = list(dict.fromkeys([str(x) for x in ids if str(x)]))
+    _add_to_memory_pool(settings, ids, limit=max(target * 3, 300))
+    return choose_candidate_order(ids, settings)
+
 def search_candidates_balanced_live(mpr: MPRester, settings: QuizSettings) -> List[str]:
     """Balanced live random search.
 
@@ -1055,7 +1158,10 @@ def search_candidates(mpr: MPRester, settings: QuizSettings) -> List[str]:
     element-seed searches every time.  This keeps the v8-like live feel, reduces
     As/V/Cr-style element bias, and avoids relying on full quiz cache.
     """
-    strategy = str(settings.random_strategy or "balanced_live")
+    strategy = str(settings.random_strategy or "fast_pool")
+
+    if strategy == "fast_pool":
+        return search_candidates_fast_pool(mpr, settings)
 
     if strategy == "balanced_live":
         return search_candidates_balanced_live(mpr, settings)
@@ -1126,6 +1232,17 @@ def search_material_ids(mpr: MPRester, query: str, settings: QuizSettings, limit
     return out
 
 
+
+
+def _fetch_bandstructure(api_key: str, mpid: str, path_type: Any):
+    with MPRester(api_key) as client:
+        return client.get_bandstructure_by_material_id(mpid, line_mode=True, path_type=path_type)
+
+
+def _fetch_dos(api_key: str, mpid: str):
+    with MPRester(api_key) as client:
+        return client.get_dos_by_material_id(mpid)
+
 def generate_quiz_for_mpid(mpr: MPRester, mpid: str, settings: QuizSettings) -> Dict[str, Any]:
     start = time.time()
     path_type = get_path_type(settings.path_type)
@@ -1133,8 +1250,19 @@ def generate_quiz_for_mpid(mpr: MPRester, mpid: str, settings: QuizSettings) -> 
     summary_doc = get_summary(mpr, mpid)
     hint = summary_to_hint(summary_doc)
 
-    bs = mpr.get_bandstructure_by_material_id(mpid, line_mode=True, path_type=path_type)
-    dos = mpr.get_dos_by_material_id(mpid)
+    # Fetch band structure and DOS in parallel.  These two MP API calls are
+    # independent and are the main bottleneck, so this noticeably improves
+    # perceived random-question speed on Render.
+    if getattr(settings, "parallel_fetch", True):
+        api_key = get_api_key(settings.api_key)
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            fut_bs = ex.submit(_fetch_bandstructure, api_key, mpid, path_type)
+            fut_dos = ex.submit(_fetch_dos, api_key, mpid)
+            bs = fut_bs.result()
+            dos = fut_dos.result()
+    else:
+        bs = mpr.get_bandstructure_by_material_id(mpid, line_mode=True, path_type=path_type)
+        dos = mpr.get_dos_by_material_id(mpid)
 
     structure = getattr(dos, "structure", None) or safe_attr(summary_doc, "structure", None)
     if structure is None:
@@ -1197,7 +1325,7 @@ def generate_quiz_for_mpid(mpr: MPRester, mpid: str, settings: QuizSettings) -> 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "cache_count": len(load_index()), "version": "15.0", "recent_count": len(load_recent_history())}
+    return {"ok": True, "cache_count": len(load_index()), "version": "16.0", "recent_count": len(load_recent_history()), "memory_candidate_pools": {k: len(v) for k, v in MEMORY_CANDIDATE_POOLS.items()}}
 
 
 @app.post("/api/quiz/new")

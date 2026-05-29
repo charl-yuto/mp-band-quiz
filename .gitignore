@@ -5,18 +5,20 @@ __pycache__/
 venv/
 .env
 
-# Node
-node_modules/
-frontend/node_modules/
-frontend/dist/
-package-lock.json
-
-# Cache / generated data
+# Backend generated/cache
+backend/.venv/
+backend/__pycache__/
 backend/cache/
 backend/static/generated/
 *.log
 
-# OS / editor
+# Frontend generated
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/package-lock.json
+
+# OS/editor
 .DS_Store
 .vscode/
 .idea/
