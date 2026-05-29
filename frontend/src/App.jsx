@@ -24,7 +24,7 @@ const DEFAULT_SETTINGS = {
   random_mpid_max: 2000000,
   random_mpid_batch_size: 300,
   random_mpid_rounds: 1,
-  fast_pool_target: 180,
+  fast_pool_target: 120,
   fast_pool_refill_rounds: 1,
   parallel_fetch: true,
   prefer_cache: false,
@@ -34,7 +34,7 @@ const DEFAULT_SETTINGS = {
   require_band_dos_props: true,
   use_candidate_cache: false,
   refresh_candidate_pool: true,
-  candidate_pool_size: 100,
+  candidate_pool_size: 80,
   candidate_num_chunks: 1,
   max_trials: 12,
   avoid_recent: true,
@@ -301,7 +301,7 @@ export default function App() {
       if (cacheOnlyOverride !== null) payload.cache_only = cacheOnlyOverride
       const data = await apiPost('/api/quiz/new', payload)
       setQuiz(data)
-      setLastInfo(`取得 ${((performance.now()-t0)/1000).toFixed(2)} 秒 / backend ${data.timing_sec ?? '?'} 秒`)
+      setLastInfo(`${data.from_memory_queue ? '即時取得' : '取得'} ${((performance.now()-t0)/1000).toFixed(2)} 秒 / backend ${data.timing_sec ?? '?'} 秒`)
       refreshCacheCount()
     } catch (e) { setError(e.message) }
     finally { setLoading(false) }

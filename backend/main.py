@@ -8,6 +8,8 @@ import re
 import time
 import traceback
 import uuid
+import threading
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -25,6 +27,8 @@ from emmet.core.electronic_structure import BSPathType
 from pymatgen.core import Element, Composition
 from pymatgen.electronic_structure.core import OrbitalType, Spin
 from pymatgen.electronic_structure.plotter import BSPlotter
+
+warnings.filterwarnings("ignore", message="No Pauling electronegativity.*")
 
 
 # ============================================================
@@ -45,6 +49,13 @@ RECENT_HISTORY = CACHE_DIR / "recent_history.json"
 # this memory while the service is alive, so subsequent random questions avoid
 # repeating slow MP summary searches while still fetching fresh band/DOS data.
 MEMORY_CANDIDATE_POOLS: Dict[str, List[str]] = {}
+# In-memory quiz queue.  This is not persisted to disk and is shuffled/refilled
+# while the Render instance is alive.  It makes the next question fast without
+# repeatedly showing the same material.
+MEMORY_QUIZ_QUEUES: Dict[str, List[Dict[str, Any]]] = {}
+QUIZ_QUEUE_LOCK = threading.Lock()
+QUIZ_REFILLING: set[str] = set()
+QUIZ_REFILL_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 QUIZ_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -55,7 +66,7 @@ CANDIDATE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 # FastAPI setup
 # ============================================================
 
-app = FastAPI(title="MP Band Quiz", version="16.0")
+app = FastAPI(title="MP Band Quiz", version="17.0-render-fast")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -113,14 +124,14 @@ class QuizSettings(BaseModel):
     random_element_seed_count: int = 6
     random_mpid_min: int = 1
     random_mpid_max: int = 2000000
-    random_mpid_batch_size: int = 500
-    random_mpid_rounds: int = 2
+    random_mpid_batch_size: int = 300
+    random_mpid_rounds: int = 1
 
     # Fast random mode.  It caches only candidate mp-ids in memory, not full
     # band/DOS payloads, so the output remains much less repetitive than full
     # quiz cache while avoiding slow repeated summary searches.
-    fast_pool_target: int = 500
-    fast_pool_refill_rounds: int = 2
+    fast_pool_target: int = 120
+    fast_pool_refill_rounds: int = 1
     parallel_fetch: bool = True
 
     # Speed / randomization
@@ -141,9 +152,9 @@ class QuizSettings(BaseModel):
     # better randomness; turn ON only if the summary search itself is too slow.
     use_candidate_cache: bool = False
     refresh_candidate_pool: bool = True
-    candidate_pool_size: int = 220
+    candidate_pool_size: int = 80
     candidate_num_chunks: int = 1
-    max_trials: int = 18
+    max_trials: int = 10
 
     # Avoid repeating recently shown materials.
     avoid_recent: bool = True
@@ -399,6 +410,85 @@ def choose_candidate_order(material_ids: List[str], settings: QuizSettings) -> L
             ids = fresh
     rng.shuffle(ids)
     return ids
+
+
+def quiz_queue_key(settings: QuizSettings) -> str:
+    data = settings.model_dump()
+    # api_key should never affect matching, and full cache toggles should not
+    # split queues.  Display energy range is kept because it changes payload size.
+    data.pop("api_key", None)
+    for k in ["prefer_cache", "cache_only", "save_cache"]:
+        data.pop(k, None)
+    raw = json.dumps(data, sort_keys=True, ensure_ascii=False)
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", raw)[:180]
+
+
+def pop_queued_quiz(settings: QuizSettings) -> Optional[Dict[str, Any]]:
+    key = quiz_queue_key(settings)
+    with QUIZ_QUEUE_LOCK:
+        q = MEMORY_QUIZ_QUEUES.get(key) or []
+        while q:
+            payload = q.pop(0)
+            mpid = payload.get("secret", {}).get("mpid")
+            if settings.avoid_recent and mpid in set(load_recent_history()[: max(1, int(settings.recent_limit))]):
+                continue
+            MEMORY_QUIZ_QUEUES[key] = q
+            return payload
+        MEMORY_QUIZ_QUEUES[key] = []
+    return None
+
+
+def push_queued_quiz(settings: QuizSettings, payload: Dict[str, Any], max_len: int = 4) -> None:
+    key = quiz_queue_key(settings)
+    with QUIZ_QUEUE_LOCK:
+        q = MEMORY_QUIZ_QUEUES.get(key, [])
+        existing = {x.get("secret", {}).get("mpid") for x in q}
+        mpid = payload.get("secret", {}).get("mpid")
+        if mpid and mpid not in existing:
+            q.append(payload)
+        MEMORY_QUIZ_QUEUES[key] = q[-max_len:]
+
+
+def maybe_refill_quiz_queue(settings: QuizSettings, count: int = 2) -> None:
+    # Render free instances are CPU-limited; keep this conservative.
+    key = quiz_queue_key(settings)
+    with QUIZ_QUEUE_LOCK:
+        if key in QUIZ_REFILLING:
+            return
+        if len(MEMORY_QUIZ_QUEUES.get(key, [])) >= count:
+            return
+        QUIZ_REFILLING.add(key)
+
+    def _worker():
+        try:
+            st = settings.model_copy(deep=True)
+            st.prefer_cache = False
+            st.cache_only = False
+            st.save_cache = False
+            # Use a small search to avoid background jobs monopolizing the free instance.
+            st.max_trials = max(4, min(int(st.max_trials), 10))
+            st.fast_pool_target = max(60, min(int(st.fast_pool_target), 160))
+            st.fast_pool_refill_rounds = 1
+            key_api = get_api_key(st.api_key)
+            made = 0
+            with MPRester(key_api) as local_mpr:
+                candidates = search_candidates(local_mpr, st)
+                for mpid in candidates:
+                    if made >= count:
+                        break
+                    try:
+                        payload = generate_quiz_for_mpid(local_mpr, mpid, st)
+                        # Store by quiz_id so answer/reveal work, but do not add to reusable cache index.
+                        save_quiz_cache(payload, add_to_index=False)
+                        push_queued_quiz(settings, payload)
+                        made += 1
+                    except Exception:
+                        continue
+        finally:
+            with QUIZ_QUEUE_LOCK:
+                QUIZ_REFILLING.discard(key)
+
+    QUIZ_REFILL_EXECUTOR.submit(_worker)
 
 
 F_BLOCK_SYMBOLS = {
@@ -1325,7 +1415,7 @@ def generate_quiz_for_mpid(mpr: MPRester, mpid: str, settings: QuizSettings) -> 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "cache_count": len(load_index()), "version": "16.0", "recent_count": len(load_recent_history()), "memory_candidate_pools": {k: len(v) for k, v in MEMORY_CANDIDATE_POOLS.items()}}
+    return {"ok": True, "cache_count": len(load_index()), "version": "17.0-render-fast", "recent_count": len(load_recent_history()), "memory_candidate_pools": {k: len(v) for k, v in MEMORY_CANDIDATE_POOLS.items()}, "memory_quiz_queues": {k: len(v) for k, v in MEMORY_QUIZ_QUEUES.items()}}
 
 
 @app.post("/api/quiz/new")
@@ -1337,13 +1427,24 @@ def new_quiz(settings: QuizSettings):
         if settings.cache_only:
             raise HTTPException(status_code=404, detail="条件に合うキャッシュがありません。cache only をOFFにしてください。")
 
+    # Fast path on Render: serve a pre-generated in-memory quiz for the same
+    # settings if available.  This does not rely on persistent disk cache and
+    # avoids showing the same material repeatedly because each queued quiz is popped.
+    queued = pop_queued_quiz(settings) if settings.fast_mode else None
+    if queued is not None:
+        add_recent_mpid(queued["secret"]["mpid"], settings.recent_limit)
+        maybe_refill_quiz_queue(settings, count=2)
+        out = public_payload(queued)
+        out["from_memory_queue"] = True
+        return out
+
     key = get_api_key(settings.api_key)
     errors: List[str] = []
     with MPRester(key) as mpr:
         # Multiple independent search rounds greatly reduce intermittent failure.
         total_trials = max(1, int(settings.max_trials))
         tried = set()
-        for round_index in range(5):
+        for round_index in range(2):
             candidates = search_candidates(mpr, settings)
             if not candidates:
                 errors.append(f"round {round_index+1}: 条件に合う候補がありません")
@@ -1358,6 +1459,7 @@ def new_quiz(settings: QuizSettings):
                     payload = generate_quiz_for_mpid(mpr, mpid, settings)
                     save_quiz_cache(payload, add_to_index=settings.save_cache)
                     add_recent_mpid(mpid, settings.recent_limit)
+                    maybe_refill_quiz_queue(settings, count=2)
                     return public_payload(payload)
                 except Exception as exc:
                     errors.append(f"{mpid}: {exc}")
@@ -1469,6 +1571,12 @@ def clear_candidate_cache():
             pass
     return {"ok": True, "message": "candidate cache cleared"}
 
+
+
+@app.head("/")
+def head_root():
+    # Render health checks may use HEAD.  Returning 200 avoids misleading 405 logs.
+    return JSONResponse(content=None, status_code=200)
 
 # ============================================================
 # Static frontend serving
