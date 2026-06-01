@@ -3,14 +3,10 @@ from __future__ import annotations
 import json
 import os
 import random
-import secrets
 import re
 import time
 import traceback
 import uuid
-import threading
-import warnings
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -24,11 +20,9 @@ from scipy.spatial import Voronoi
 
 from mp_api.client import MPRester
 from emmet.core.electronic_structure import BSPathType
-from pymatgen.core import Element, Composition
+from pymatgen.core import Element
 from pymatgen.electronic_structure.core import OrbitalType, Spin
 from pymatgen.electronic_structure.plotter import BSPlotter
-
-warnings.filterwarnings("ignore", message="No Pauling electronegativity.*")
 
 
 # ============================================================
@@ -44,19 +38,6 @@ CANDIDATE_CACHE_DIR = CACHE_DIR / "candidate_pools"
 CACHE_INDEX = CACHE_DIR / "index.json"
 RECENT_HISTORY = CACHE_DIR / "recent_history.json"
 
-# In-memory candidate ID pools. These are not full quiz caches; they only store
-# material IDs that matched inexpensive summary-level filters.  Render keeps
-# this memory while the service is alive, so subsequent random questions avoid
-# repeating slow MP summary searches while still fetching fresh band/DOS data.
-MEMORY_CANDIDATE_POOLS: Dict[str, List[str]] = {}
-# In-memory quiz queue.  This is not persisted to disk and is shuffled/refilled
-# while the Render instance is alive.  It makes the next question fast without
-# repeatedly showing the same material.
-MEMORY_QUIZ_QUEUES: Dict[str, List[Dict[str, Any]]] = {}
-QUIZ_QUEUE_LOCK = threading.Lock()
-QUIZ_REFILLING: set[str] = set()
-QUIZ_REFILL_EXECUTOR = ThreadPoolExecutor(max_workers=1)
-
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 QUIZ_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CANDIDATE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -66,7 +47,7 @@ CANDIDATE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 # FastAPI setup
 # ============================================================
 
-app = FastAPI(title="MP Band Quiz", version="17.0-render-fast")
+app = FastAPI(title="MP Band Quiz", version="8.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -105,35 +86,6 @@ class QuizSettings(BaseModel):
 
     path_type: str = "hinuma"
 
-    # Electronic/orbital filters
-    # electron_system: any, sp, d, f, exclude_f_block
-    electron_system: str = "any"
-    selected_orbitals: List[str] = Field(default_factory=lambda: ["s", "p", "d", "f"])
-    exclude_f_block: bool = False
-    exclude_missing_f_dos: bool = True
-
-    # Search randomization.  Multiple random element seeds reduce the bias of
-    # repeated MP summary.search calls while still avoiding full quiz cache.
-    # Random search method:
-    #   mpid_batch: generate random mp-ids and query them in batches.
-    #               This avoids element bias such as As/V/Cr appearing too often.
-    #   element_seed: query by random element seeds. Faster sometimes, but biased.
-    #   hybrid: try mpid_batch first, then element_seed fallback.
-    random_strategy: str = "fast_pool"
-    random_element_search: bool = True
-    random_element_seed_count: int = 6
-    random_mpid_min: int = 1
-    random_mpid_max: int = 2000000
-    random_mpid_batch_size: int = 300
-    random_mpid_rounds: int = 1
-
-    # Fast random mode.  It caches only candidate mp-ids in memory, not full
-    # band/DOS payloads, so the output remains much less repetitive than full
-    # quiz cache while avoiding slow repeated summary searches.
-    fast_pool_target: int = 120
-    fast_pool_refill_rounds: int = 1
-    parallel_fetch: bool = True
-
     # Speed / randomization
     # v8 default is LIVE RANDOM: do not reuse full quiz cache and do not prefetch.
     # The only acceleration is a faster MP summary query and optional lightweight
@@ -152,18 +104,18 @@ class QuizSettings(BaseModel):
     # better randomness; turn ON only if the summary search itself is too slow.
     use_candidate_cache: bool = False
     refresh_candidate_pool: bool = True
-    candidate_pool_size: int = 80
+    candidate_pool_size: int = 120
     candidate_num_chunks: int = 1
-    max_trials: int = 10
+    max_trials: int = 6
 
     # Avoid repeating recently shown materials.
     avoid_recent: bool = True
     recent_limit: int = 1000
 
     # Data window sent to frontend. Frontend can interactively zoom further.
-    energy_min: float = -12.0
-    energy_max: float = 12.0
-    data_energy_padding: float = 8.0
+    energy_min: float = -8.0
+    energy_max: float = 8.0
+    data_energy_padding: float = 4.0
 
 
 class CheckAnswerRequest(BaseModel):
@@ -177,11 +129,6 @@ class RevealRequest(BaseModel):
 
 class PrefetchRequest(BaseModel):
     count: int = 5
-    settings: QuizSettings
-
-
-class SearchQuizRequest(BaseModel):
-    query: str
     settings: QuizSettings
 
 
@@ -354,17 +301,6 @@ def settings_candidate_key(settings: QuizSettings) -> str:
         "pool_size": settings.candidate_pool_size,
         "num_chunks": settings.candidate_num_chunks,
         "require_band_dos_props": settings.require_band_dos_props,
-        "electron_system": settings.electron_system,
-        "exclude_f_block": settings.exclude_f_block,
-        "exclude_missing_f_dos": settings.exclude_missing_f_dos,
-        "random_strategy": settings.random_strategy,
-        "selected_orbitals": sorted([str(x) for x in (settings.selected_orbitals or [])]),
-        "random_element_seed_count": settings.random_element_seed_count,
-        "random_mpid_min": settings.random_mpid_min,
-        "random_mpid_max": settings.random_mpid_max,
-        "random_mpid_batch_size": settings.random_mpid_batch_size,
-        "random_mpid_rounds": settings.random_mpid_rounds,
-        "fast_pool_target": settings.fast_pool_target,
     }
     raw = json.dumps(key, sort_keys=True, ensure_ascii=False)
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw)[:160]
@@ -401,227 +337,14 @@ def save_candidate_pool(settings: QuizSettings, material_ids: List[str]):
 
 
 def choose_candidate_order(material_ids: List[str], settings: QuizSettings) -> List[str]:
-    rng = secrets.SystemRandom()
     ids = list(dict.fromkeys([str(x) for x in material_ids]))
     if settings.avoid_recent:
         recent = set(load_recent_history()[: max(1, int(settings.recent_limit))])
         fresh = [x for x in ids if x not in recent]
         if fresh:
             ids = fresh
-    rng.shuffle(ids)
+    random.shuffle(ids)
     return ids
-
-
-def quiz_queue_key(settings: QuizSettings) -> str:
-    data = settings.model_dump()
-    # api_key should never affect matching, and full cache toggles should not
-    # split queues.  Display energy range is kept because it changes payload size.
-    data.pop("api_key", None)
-    for k in ["prefer_cache", "cache_only", "save_cache"]:
-        data.pop(k, None)
-    raw = json.dumps(data, sort_keys=True, ensure_ascii=False)
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", raw)[:180]
-
-
-def pop_queued_quiz(settings: QuizSettings) -> Optional[Dict[str, Any]]:
-    key = quiz_queue_key(settings)
-    with QUIZ_QUEUE_LOCK:
-        q = MEMORY_QUIZ_QUEUES.get(key) or []
-        while q:
-            payload = q.pop(0)
-            mpid = payload.get("secret", {}).get("mpid")
-            if settings.avoid_recent and mpid in set(load_recent_history()[: max(1, int(settings.recent_limit))]):
-                continue
-            MEMORY_QUIZ_QUEUES[key] = q
-            return payload
-        MEMORY_QUIZ_QUEUES[key] = []
-    return None
-
-
-def push_queued_quiz(settings: QuizSettings, payload: Dict[str, Any], max_len: int = 4) -> None:
-    key = quiz_queue_key(settings)
-    with QUIZ_QUEUE_LOCK:
-        q = MEMORY_QUIZ_QUEUES.get(key, [])
-        existing = {x.get("secret", {}).get("mpid") for x in q}
-        mpid = payload.get("secret", {}).get("mpid")
-        if mpid and mpid not in existing:
-            q.append(payload)
-        MEMORY_QUIZ_QUEUES[key] = q[-max_len:]
-
-
-def maybe_refill_quiz_queue(settings: QuizSettings, count: int = 2) -> None:
-    # Render free instances are CPU-limited; keep this conservative.
-    key = quiz_queue_key(settings)
-    with QUIZ_QUEUE_LOCK:
-        if key in QUIZ_REFILLING:
-            return
-        if len(MEMORY_QUIZ_QUEUES.get(key, [])) >= count:
-            return
-        QUIZ_REFILLING.add(key)
-
-    def _worker():
-        try:
-            st = settings.model_copy(deep=True)
-            st.prefer_cache = False
-            st.cache_only = False
-            st.save_cache = False
-            # Use a small search to avoid background jobs monopolizing the free instance.
-            st.max_trials = max(4, min(int(st.max_trials), 10))
-            st.fast_pool_target = max(60, min(int(st.fast_pool_target), 160))
-            st.fast_pool_refill_rounds = 1
-            key_api = get_api_key(st.api_key)
-            made = 0
-            with MPRester(key_api) as local_mpr:
-                candidates = search_candidates(local_mpr, st)
-                for mpid in candidates:
-                    if made >= count:
-                        break
-                    try:
-                        payload = generate_quiz_for_mpid(local_mpr, mpid, st)
-                        # Store by quiz_id so answer/reveal work, but do not add to reusable cache index.
-                        save_quiz_cache(payload, add_to_index=False)
-                        push_queued_quiz(settings, payload)
-                        made += 1
-                    except Exception:
-                        continue
-        finally:
-            with QUIZ_QUEUE_LOCK:
-                QUIZ_REFILLING.discard(key)
-
-    QUIZ_REFILL_EXECUTOR.submit(_worker)
-
-
-F_BLOCK_SYMBOLS = {
-    "La", "Ce", "Pr", "Nd", "Pm", "Sm", "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu",
-    "Ac", "Th", "Pa", "U", "Np", "Pu", "Am", "Cm", "Bk", "Cf", "Es", "Fm", "Md", "No", "Lr",
-}
-D_BLOCK_SYMBOLS = {
-    "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn",
-    "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd",
-    "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg",
-}
-SP_BLOCK_SYMBOLS = {
-    "H", "Li", "Be", "B", "C", "N", "O", "F", "Ne",
-    "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar",
-    "K", "Ca", "Ga", "Ge", "As", "Se", "Br", "Kr",
-    "Rb", "Sr", "In", "Sn", "Sb", "Te", "I", "Xe",
-    "Cs", "Ba", "Tl", "Pb", "Bi", "Po", "At", "Rn",
-}
-COMMON_RANDOM_SYMBOLS = sorted(SP_BLOCK_SYMBOLS | D_BLOCK_SYMBOLS | F_BLOCK_SYMBOLS)
-
-
-def valid_element_symbols_from_doc(doc: Any) -> List[str]:
-    elems = safe_attr(doc, "elements", None)
-    out: List[str] = []
-    if elems:
-        for e in elems:
-            try:
-                out.append(str(getattr(e, "symbol", e)))
-            except Exception:
-                pass
-    if out:
-        return out
-    formula = safe_attr(doc, "formula_pretty", None)
-    if formula:
-        try:
-            return [str(el) for el in Composition(str(formula)).elements]
-        except Exception:
-            return []
-    return []
-
-
-def is_f_block_symbol(sym: str) -> bool:
-    return str(sym) in F_BLOCK_SYMBOLS
-
-
-def allowed_seed_symbols(settings: QuizSettings) -> List[str]:
-    mode = str(settings.electron_system or "any")
-    if mode == "d":
-        syms = sorted(D_BLOCK_SYMBOLS)
-    elif mode == "f":
-        syms = sorted(F_BLOCK_SYMBOLS)
-    elif mode == "sp":
-        syms = sorted(SP_BLOCK_SYMBOLS)
-    elif mode == "exclude_f_block" or settings.exclude_f_block:
-        syms = sorted((SP_BLOCK_SYMBOLS | D_BLOCK_SYMBOLS) - F_BLOCK_SYMBOLS)
-    else:
-        syms = COMMON_RANDOM_SYMBOLS
-    return syms
-
-
-def summary_doc_matches_filters(doc: Any, settings: QuizSettings) -> bool:
-    ne = safe_attr(doc, "nelements", None)
-    try:
-        ne = int(ne)
-    except Exception:
-        return False
-    if not (settings.nelements_min <= ne <= settings.nelements_max):
-        return False
-    if settings.material_kind == "element" and ne != 1:
-        return False
-    if settings.material_kind == "compound" and ne <= 1:
-        return False
-    if settings.metallicity == "metal" and safe_attr(doc, "is_metal", None) is not True:
-        return False
-    if settings.metallicity == "nonmetal" and safe_attr(doc, "is_metal", None) is not False:
-        return False
-    if settings.stability == "stable_only" and safe_attr(doc, "is_stable", None) is not True:
-        return False
-    elems = valid_element_symbols_from_doc(doc)
-    has_f_block = any(is_f_block_symbol(e) for e in elems)
-    if settings.exclude_f_block or settings.electron_system == "exclude_f_block":
-        if has_f_block:
-            return False
-    # Coarse prefilters.  Final decision for d/f/sp is made after DOS is read.
-    if settings.electron_system == "d" and not any(e in D_BLOCK_SYMBOLS for e in elems):
-        return False
-    if settings.electron_system == "f" and not has_f_block:
-        return False
-    if settings.electron_system == "sp" and any((e in D_BLOCK_SYMBOLS or e in F_BLOCK_SYMBOLS) for e in elems):
-        return False
-    return True
-
-
-def orbital_weights_from_curves(curves: List[Dict[str, Any]]) -> Dict[str, float]:
-    weights = {"s": 0.0, "p": 0.0, "d": 0.0, "f": 0.0}
-    for c in curves or []:
-        orb = str(c.get("orbital", ""))
-        y = c.get("y") or []
-        if orb in weights:
-            try:
-                weights[orb] += float(np.nansum(np.abs(np.asarray(y, dtype=float))))
-            except Exception:
-                pass
-    return weights
-
-
-def payload_matches_orbital_filters(payload: Dict[str, Any], settings: QuizSettings) -> Tuple[bool, str]:
-    curves = payload.get("dos", {}).get("curves", [])
-    if not curves:
-        return False, "DOS curve が空です"
-    allowed = {str(x).lower() for x in (settings.selected_orbitals or ["s", "p", "d", "f"])}
-    if allowed:
-        curves = [c for c in curves if str(c.get("orbital", "")).lower() in allowed]
-        payload["dos"]["curves"] = curves
-    if not curves:
-        return False, "選択軌道に対応するDOSがありません"
-    weights = orbital_weights_from_curves(curves)
-    total = sum(weights.values())
-    if total <= 0:
-        return False, "DOS weight がゼロです"
-    mode = str(settings.electron_system or "any")
-    if mode == "d" and weights.get("d", 0.0) <= 0:
-        return False, "d-DOS がありません"
-    if mode == "f" and weights.get("f", 0.0) <= 0:
-        return False, "f-DOS がありません"
-    if mode == "sp" and (weights.get("d", 0.0) + weights.get("f", 0.0)) > 0.35 * total:
-        return False, "s/p系としては d/f 成分が大きすぎます"
-    alias_map = payload.get("secret", {}).get("alias_map", {})
-    true_elements = set(alias_map.keys())
-    contains_f_block = any(is_f_block_symbol(e) for e in true_elements)
-    if settings.exclude_missing_f_dos and contains_f_block and weights.get("f", 0.0) <= 0:
-        return False, "fブロック元素を含むのに f-DOS がありません"
-    return True, ""
 
 
 def cache_path(quiz_id: str) -> Path:
@@ -718,7 +441,7 @@ def element_order_from_structure(structure) -> List[str]:
         return []
 
 
-def get_element_orbital_dos(dos, alias_map: Dict[str, str], energy_min: float, energy_max: float, padding: float, selected_orbitals: Optional[List[str]] = None) -> Tuple[List[float], List[Dict[str, Any]], List[Dict[str, str]]]:
+def get_element_orbital_dos(dos, alias_map: Dict[str, str], energy_min: float, energy_max: float, padding: float) -> Tuple[List[float], List[Dict[str, Any]], List[Dict[str, str]]]:
     energies = np.asarray(dos.energies, dtype=float) - float(dos.efermi)
     lo = energy_min - padding
     hi = energy_max + padding
@@ -727,7 +450,6 @@ def get_element_orbital_dos(dos, alias_map: Dict[str, str], energy_min: float, e
         mask = np.ones_like(energies, dtype=bool)
 
     order = element_order_from_structure(dos.structure)
-    allowed_orbs = {str(x).lower() for x in (selected_orbitals or ["s", "p", "d", "f"])}
     out = []
     label_map = []
 
@@ -749,7 +471,7 @@ def get_element_orbital_dos(dos, alias_map: Dict[str, str], energy_min: float, e
                 tmp[orb_label] = dens[mask].tolist()
 
         for orb_label in ["s", "p", "d", "f"]:
-            if orb_label in allowed_orbs and orb_label in tmp:
+            if orb_label in tmp:
                 true_label = f"{elem_symbol} {orb_label}"
                 shown = display_label(true_label, alias_map)
                 out.append({"true_label": true_label, "label": shown, "orbital": orb_label, "element": elem_symbol, "y": tmp[orb_label]})
@@ -761,7 +483,7 @@ def get_element_orbital_dos(dos, alias_map: Dict[str, str], energy_min: float, e
             for orb, pdos in dos.get_spd_dos().items():
                 orb_label = orbital_type_to_label(orb)
                 dens = sum_spin_densities(pdos.densities)
-                if orb_label in allowed_orbs and dens.size and np.nanmax(np.abs(dens)) > 1e-12:
+                if dens.size and np.nanmax(np.abs(dens)) > 1e-12:
                     out.append({"true_label": orb_label, "label": orb_label, "orbital": orb_label, "element": "", "y": dens[mask].tolist()})
         except Exception:
             pass
@@ -926,7 +648,6 @@ def summary_to_hint(doc) -> Dict[str, Any]:
         "spacegroup_symbol": safe_attr(sym, "symbol", None),
         "spacegroup_number": safe_attr(sym, "number", None),
         "point_group": safe_attr(sym, "point_group", None),
-        "elements": [str(getattr(e, "symbol", e)) for e in (safe_attr(doc, "elements", None) or [])],
     }
     for k, v in list(info.items()):
         if v is not None and not isinstance(v, (str, int, float, bool)):
@@ -940,7 +661,7 @@ def get_summary(mpr: MPRester, mpid: str):
         fields=[
             "material_id", "formula_pretty", "formula_anonymous", "symmetry",
             "nsites", "is_metal", "band_gap", "nelements", "is_stable",
-            "energy_above_hull", "elements", "structure",
+            "energy_above_hull", "structure",
         ],
     )
     if not docs:
@@ -948,153 +669,23 @@ def get_summary(mpr: MPRester, mpid: str):
     return docs[0]
 
 
-def _summary_search_once(mpr: MPRester, kwargs: Dict[str, Any]) -> List[Any]:
-    try:
-        return list(mpr.materials.summary.search(**kwargs))
-    except Exception as exc:
-        # Fall back if has_props is not accepted by the installed mp-api/server.
-        if "has_props" in kwargs:
-            kw2 = dict(kwargs)
-            kw2.pop("has_props", None)
-            return list(mpr.materials.summary.search(**kw2))
-        raise exc
+def search_candidates(mpr: MPRester, settings: QuizSettings) -> List[str]:
+    """Return randomized candidate mp-ids using a lightweight summary query.
 
-
-def _doc_has_required_band_dos(doc: Any, settings: QuizSettings) -> bool:
-    """Check summary.has_props in Python when possible."""
-    if not settings.require_band_dos_props:
-        return True
-    props = safe_attr(doc, "has_props", None)
-    if props is None:
-        return True
-    try:
-        prop_set = {str(x).lower() for x in props}
-    except Exception:
-        prop_set = {str(props).lower()}
-    return "bandstructure" in prop_set and "dos" in prop_set
-
-
-def _random_material_id_batch(rng: secrets.SystemRandom, settings: QuizSettings, batch_size: int) -> List[str]:
-    lo = max(1, int(settings.random_mpid_min))
-    hi = max(lo + 1, int(settings.random_mpid_max))
-    ids = set()
-    while len(ids) < batch_size:
-        ids.add(f"mp-{rng.randint(lo, hi)}")
-    return list(ids)
-
-
-
-
-def _memory_pool_key(settings: QuizSettings) -> str:
-    """Key for in-memory candidate ID pools.
-
-    This intentionally keys only by filters that affect candidate validity.
-    It does not key by display-only settings such as energy range.
-    """
-    return settings_candidate_key(settings)
-
-
-def _take_from_memory_pool(settings: QuizSettings, count: int) -> List[str]:
-    key = _memory_pool_key(settings)
-    pool = MEMORY_CANDIDATE_POOLS.get(key, [])
-    if not pool:
-        return []
-    if settings.avoid_recent:
-        recent = set(load_recent_history()[: max(1, int(settings.recent_limit))])
-        pool = [x for x in pool if x not in recent]
-    rng = secrets.SystemRandom()
-    rng.shuffle(pool)
-    chosen = pool[: max(1, int(count))]
-    remaining = [x for x in pool if x not in set(chosen)]
-    MEMORY_CANDIDATE_POOLS[key] = remaining
-    return chosen
-
-
-def _add_to_memory_pool(settings: QuizSettings, ids: List[str], limit: Optional[int] = None) -> None:
-    key = _memory_pool_key(settings)
-    current = MEMORY_CANDIDATE_POOLS.get(key, [])
-    merged = list(dict.fromkeys([str(x) for x in current + list(ids) if str(x)]))
-    secrets.SystemRandom().shuffle(merged)
-    if limit is None:
-        limit = max(200, int(settings.fast_pool_target) * 3)
-    MEMORY_CANDIDATE_POOLS[key] = merged[: int(limit)]
-
-def search_candidates_by_random_mpid(mpr: MPRester, settings: QuizSettings) -> List[str]:
-    """Candidate search with much less element bias.
-
-    Random material IDs are queried in batches.  Invalid IDs simply return no
-    documents, while valid ones are filtered by the current quiz conditions.
-    This is not perfectly uniform over all MP materials, but it avoids the
-    strong element-seed bias that made As/V/Cr appear too frequently.
-    """
-    rng = secrets.SystemRandom()
-    fields = [
-        "material_id", "formula_pretty", "formula_anonymous", "symmetry",
-        "nsites", "is_metal", "band_gap", "nelements", "is_stable",
-        "energy_above_hull", "elements", "has_props",
-    ]
-    minimal_fields = [
-        "material_id", "formula_pretty", "formula_anonymous", "symmetry",
-        "nsites", "is_metal", "band_gap", "nelements", "is_stable",
-        "energy_above_hull", "elements",
-    ]
-
-    batch_size = max(40, min(int(settings.random_mpid_batch_size), 2000))
-    rounds = max(1, min(int(settings.random_mpid_rounds), 20))
-
-    docs: List[Any] = []
-    for _ in range(rounds):
-        mids = _random_material_id_batch(rng, settings, batch_size)
-        try:
-            docs.extend(list(mpr.materials.summary.search(material_ids=mids, fields=fields)))
-        except Exception:
-            try:
-                docs.extend(list(mpr.materials.summary.search(material_ids=mids, fields=minimal_fields)))
-            except Exception:
-                continue
-
-    rng.shuffle(docs)
-    candidates: List[str] = []
-    seen = set()
-    for d in docs:
-        if not _doc_has_required_band_dos(d, settings):
-            continue
-        if not summary_doc_matches_filters(d, settings):
-            continue
-        mid = str(safe_attr(d, "material_id", ""))
-        if mid and mid not in seen:
-            seen.add(mid)
-            candidates.append(mid)
-    return choose_candidate_order(candidates, settings)
-
-
-def search_candidates_by_element_seed(mpr: MPRester, settings: QuizSettings) -> List[str]:
-    """Element-seeded candidate search.
-
-    This is retained as an optional/fallback strategy, but it can bias output
-    toward certain elements depending on MP summary ordering and filters.
-
-    v13 keeps the v8 UI/flow but fixes the weak randomness by doing several
-    independent element-seeded summary searches, merging the results, removing
-    duplicates, and shuffling with secrets.SystemRandom.
+    v8 intentionally avoids full problem prefetch/cache by default.  Speed is
+    improved by asking MP summary for materials that have bandstructure and DOS
+    when the local mp-api supports the has_props filter.
     """
     if settings.use_candidate_cache:
         cached = load_candidate_pool(settings)
         if cached:
             return choose_candidate_order(cached, settings)
 
-    rng = secrets.SystemRandom()
     fields = [
         "material_id", "formula_pretty", "formula_anonymous", "symmetry",
         "nsites", "is_metal", "band_gap", "nelements", "is_stable",
-        "energy_above_hull", "elements", "has_props",
+        "energy_above_hull", "has_props",
     ]
-    minimal_fields = [
-        "material_id", "formula_pretty", "formula_anonymous", "symmetry",
-        "nsites", "is_metal", "band_gap", "nelements", "is_stable",
-        "energy_above_hull", "elements",
-    ]
-
     chunk_size = max(20, min(int(settings.candidate_pool_size), 500))
     num_chunks = max(1, min(int(settings.candidate_num_chunks), 20))
 
@@ -1109,229 +700,59 @@ def search_candidates_by_element_seed(mpr: MPRester, settings: QuizSettings) -> 
         base_kwargs["is_metal"] = True
     elif settings.metallicity == "nonmetal":
         base_kwargs["is_metal"] = False
+
+    attempts: List[Dict[str, Any]] = []
     if settings.require_band_dos_props:
-        base_kwargs["has_props"] = ["bandstructure", "dos"]
+        # Several mp-api versions accept strings here.  Some may require enum
+        # values, and older versions may not accept the kwarg at all.  Therefore
+        # we try and fall back cleanly.
+        attempts.append({**base_kwargs, "has_props": ["bandstructure", "dos"]})
+        attempts.append({**base_kwargs, "has_props": ["electronic_structure"]})
+    attempts.append(base_kwargs)
 
-    query_kwargs: List[Dict[str, Any]] = []
-    if settings.random_element_search:
-        seeds = allowed_seed_symbols(settings)
-        rng.shuffle(seeds)
-        nseed = max(1, min(int(settings.random_element_seed_count), 16))
-        for sym in seeds[:nseed]:
-            query_kwargs.append({**base_kwargs, "elements": [sym]})
-    # Add one broad query as a safety net, but shuffle/merge means it no longer dominates.
-    query_kwargs.append(dict(base_kwargs))
-
-    docs: List[Any] = []
     last_exc: Optional[Exception] = None
-    for kwargs in query_kwargs:
+    docs = []
+    for kwargs in attempts:
         try:
-            docs.extend(_summary_search_once(mpr, kwargs))
+            docs = mpr.materials.summary.search(**kwargs)
+            break
         except Exception as exc:
             last_exc = exc
-            try:
-                kw2 = dict(kwargs)
-                kw2["fields"] = minimal_fields
-                kw2.pop("has_props", None)
-                docs.extend(list(mpr.materials.summary.search(**kw2)))
-            except Exception:
-                continue
-
+            docs = []
+            continue
     if not docs and last_exc is not None:
-        raise last_exc
+        # one last minimal fallback without newer fields
+        minimal_fields = ["material_id", "formula_pretty", "formula_anonymous", "symmetry", "nsites", "is_metal", "band_gap", "nelements", "is_stable", "energy_above_hull"]
+        try:
+            docs = mpr.materials.summary.search(fields=minimal_fields, chunk_size=chunk_size, num_chunks=num_chunks)
+        except Exception:
+            raise last_exc
 
-    rng.shuffle(docs)
-    candidates: List[str] = []
-    seen = set()
+    candidates = []
     for d in docs:
-        if not summary_doc_matches_filters(d, settings):
+        ne = safe_attr(d, "nelements", None)
+        try:
+            ne = int(ne)
+        except Exception:
             continue
-        mid = str(safe_attr(d, "material_id", ""))
-        if mid and mid not in seen:
-            seen.add(mid)
-            candidates.append(mid)
+        if not (settings.nelements_min <= ne <= settings.nelements_max):
+            continue
+        if settings.material_kind == "element" and ne != 1:
+            continue
+        if settings.material_kind == "compound" and ne <= 1:
+            continue
+        if settings.metallicity == "metal" and safe_attr(d, "is_metal", None) is not True:
+            continue
+        if settings.metallicity == "nonmetal" and safe_attr(d, "is_metal", None) is not False:
+            continue
+        if settings.stability == "stable_only" and safe_attr(d, "is_stable", None) is not True:
+            continue
+        candidates.append(str(safe_attr(d, "material_id")))
 
+    candidates = list(dict.fromkeys(candidates))
     if settings.use_candidate_cache and candidates:
         save_candidate_pool(settings, candidates)
     return choose_candidate_order(candidates, settings)
-
-
-
-
-
-def search_candidates_fast_pool(mpr: MPRester, settings: QuizSettings) -> List[str]:
-    """Fast random candidate search.
-
-    The previous fully-live random search repeated expensive MP summary queries
-    on every question.  This function keeps a large in-memory pool of candidate
-    mp-ids for the current filters.  It does NOT cache complete quizzes, band
-    structures, DOS, answers, or structures.  Each selected mp-id still fetches
-    fresh band/DOS data, but candidate discovery becomes much faster after the
-    first refill.
-    """
-    requested = max(20, int(settings.max_trials) * 4)
-    from_pool = _take_from_memory_pool(settings, requested)
-    if len(from_pool) >= max(8, int(settings.max_trials)):
-        return choose_candidate_order(from_pool, settings)
-
-    ids: List[str] = list(from_pool)
-    target = max(80, int(settings.fast_pool_target))
-    refill_rounds = max(1, min(int(settings.fast_pool_refill_rounds), 8))
-
-    # Refill with mp-id random first to avoid element bias.  If strict filters
-    # produce too few valid docs, enrich with element-seeded search.
-    for _ in range(refill_rounds):
-        try:
-            st = settings.model_copy(deep=True)
-            st.use_candidate_cache = False
-            st.refresh_candidate_pool = True
-            st.random_mpid_rounds = max(1, min(int(settings.random_mpid_rounds), 4))
-            st.random_mpid_batch_size = max(120, min(int(settings.random_mpid_batch_size), 1200))
-            ids.extend(search_candidates_by_random_mpid(mpr, st))
-        except Exception:
-            pass
-        if len(set(ids)) >= target:
-            break
-        try:
-            st = settings.model_copy(deep=True)
-            st.use_candidate_cache = False
-            st.refresh_candidate_pool = True
-            st.random_element_seed_count = max(3, min(int(settings.random_element_seed_count), 10))
-            st.candidate_pool_size = max(60, min(int(settings.candidate_pool_size), 250))
-            ids.extend(search_candidates_by_element_seed(mpr, st))
-        except Exception:
-            pass
-        if len(set(ids)) >= target:
-            break
-
-    ids = list(dict.fromkeys([str(x) for x in ids if str(x)]))
-    _add_to_memory_pool(settings, ids, limit=max(target * 3, 300))
-    return choose_candidate_order(ids, settings)
-
-def search_candidates_balanced_live(mpr: MPRester, settings: QuizSettings) -> List[str]:
-    """Balanced live random search.
-
-    The old pure element-seed search could overproduce familiar elements, while
-    pure mp-id random search may return too few documents under strict filters.
-    This hybrid ALWAYS mixes both sources, deduplicates, filters, and shuffles.
-    It does not reuse full quiz cache, so each question is still live/random.
-    """
-    rng = secrets.SystemRandom()
-    all_ids: List[str] = []
-
-    # 1. Nearly element-neutral random mp-id sampling.
-    try:
-        all_ids.extend(search_candidates_by_random_mpid(mpr, settings))
-    except Exception:
-        pass
-
-    # 2. Element-seeded sampling as a fallback/enrichment, but with candidate
-    # cache forcibly disabled in this local copy to avoid stale/repeated pools.
-    try:
-        st = settings.model_copy(deep=True)
-        st.use_candidate_cache = False
-        st.refresh_candidate_pool = True
-        # Use many small independent seeds rather than one big ordered MP page.
-        st.random_element_seed_count = max(4, min(int(settings.random_element_seed_count or 6), 12))
-        st.candidate_pool_size = max(40, min(int(settings.candidate_pool_size or 180), 220))
-        all_ids.extend(search_candidates_by_element_seed(mpr, st))
-    except Exception:
-        pass
-
-    # 3. Remove duplicates and recent materials, then shuffle with SystemRandom.
-    return choose_candidate_order(all_ids, settings)
-
-def search_candidates(mpr: MPRester, settings: QuizSettings) -> List[str]:
-    """Dispatch candidate search.
-
-    v15 default is balanced_live: combine random mp-id batches and randomized
-    element-seed searches every time.  This keeps the v8-like live feel, reduces
-    As/V/Cr-style element bias, and avoids relying on full quiz cache.
-    """
-    strategy = str(settings.random_strategy or "fast_pool")
-
-    if strategy == "fast_pool":
-        return search_candidates_fast_pool(mpr, settings)
-
-    if strategy == "balanced_live":
-        return search_candidates_balanced_live(mpr, settings)
-
-    if settings.use_candidate_cache:
-        cached = load_candidate_pool(settings)
-        if cached:
-            return choose_candidate_order(cached, settings)
-
-    candidates: List[str] = []
-    if strategy in {"mpid_batch", "hybrid"}:
-        candidates = search_candidates_by_random_mpid(mpr, settings)
-
-    if (not candidates) and strategy in {"element_seed", "hybrid"}:
-        candidates = search_candidates_by_element_seed(mpr, settings)
-
-    if settings.use_candidate_cache and candidates:
-        save_candidate_pool(settings, candidates)
-    return choose_candidate_order(candidates, settings)
-
-
-def search_material_ids(mpr: MPRester, query: str, settings: QuizSettings, limit: int = 25) -> List[str]:
-    q = (query or "").strip()
-    if not q:
-        return []
-    if re.fullmatch(r"mp-\d+", q):
-        return [q]
-
-    fields = ["material_id", "formula_pretty", "formula_anonymous", "symmetry", "nsites", "is_metal", "band_gap", "nelements", "is_stable", "energy_above_hull", "elements"]
-    docs: List[Any] = []
-
-    def add_docs(**kwargs):
-        nonlocal docs
-        try:
-            docs.extend(list(mpr.materials.summary.search(fields=fields, chunk_size=min(max(limit, 20), 100), num_chunks=1, **kwargs)))
-        except Exception:
-            pass
-
-    # Formula search, e.g. Si, Fe2O3, SrTiO3.
-    add_docs(formula=q)
-    try:
-        comp = Composition(q)
-        add_docs(formula=str(comp.reduced_formula))
-        elems = [str(el) for el in comp.elements]
-        if elems:
-            add_docs(elements=elems)
-            add_docs(chemsys="-".join(sorted(elems)))
-    except Exception:
-        pass
-
-    # Element or chemical system search, e.g. O, Fe-O.
-    if re.fullmatch(r"[A-Z][a-z]?", q):
-        add_docs(elements=[q])
-    if "-" in q:
-        add_docs(chemsys=q)
-
-    out: List[str] = []
-    seen = set()
-    for d in docs:
-        if not summary_doc_matches_filters(d, settings):
-            continue
-        mid = str(safe_attr(d, "material_id", ""))
-        if mid and mid not in seen:
-            seen.add(mid)
-            out.append(mid)
-        if len(out) >= limit:
-            break
-    return out
-
-
-
-
-def _fetch_bandstructure(api_key: str, mpid: str, path_type: Any):
-    with MPRester(api_key) as client:
-        return client.get_bandstructure_by_material_id(mpid, line_mode=True, path_type=path_type)
-
-
-def _fetch_dos(api_key: str, mpid: str):
-    with MPRester(api_key) as client:
-        return client.get_dos_by_material_id(mpid)
 
 def generate_quiz_for_mpid(mpr: MPRester, mpid: str, settings: QuizSettings) -> Dict[str, Any]:
     start = time.time()
@@ -1340,19 +761,8 @@ def generate_quiz_for_mpid(mpr: MPRester, mpid: str, settings: QuizSettings) -> 
     summary_doc = get_summary(mpr, mpid)
     hint = summary_to_hint(summary_doc)
 
-    # Fetch band structure and DOS in parallel.  These two MP API calls are
-    # independent and are the main bottleneck, so this noticeably improves
-    # perceived random-question speed on Render.
-    if getattr(settings, "parallel_fetch", True):
-        api_key = get_api_key(settings.api_key)
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            fut_bs = ex.submit(_fetch_bandstructure, api_key, mpid, path_type)
-            fut_dos = ex.submit(_fetch_dos, api_key, mpid)
-            bs = fut_bs.result()
-            dos = fut_dos.result()
-    else:
-        bs = mpr.get_bandstructure_by_material_id(mpid, line_mode=True, path_type=path_type)
-        dos = mpr.get_dos_by_material_id(mpid)
+    bs = mpr.get_bandstructure_by_material_id(mpid, line_mode=True, path_type=path_type)
+    dos = mpr.get_dos_by_material_id(mpid)
 
     structure = getattr(dos, "structure", None) or safe_attr(summary_doc, "structure", None)
     if structure is None:
@@ -1365,7 +775,6 @@ def generate_quiz_for_mpid(mpr: MPRester, mpid: str, settings: QuizSettings) -> 
         energy_min=settings.energy_min,
         energy_max=settings.energy_max,
         padding=settings.data_energy_padding,
-        selected_orbitals=settings.selected_orbitals,
     )
 
     band = band_data_from_bs(bs, settings.energy_min, settings.energy_max, settings.data_energy_padding)
@@ -1403,9 +812,6 @@ def generate_quiz_for_mpid(mpr: MPRester, mpid: str, settings: QuizSettings) -> 
             "alias_map": alias_map,
         },
     }
-    ok, reason = payload_matches_orbital_filters(payload, settings)
-    if not ok:
-        raise RuntimeError(reason)
     return payload
 
 
@@ -1415,7 +821,7 @@ def generate_quiz_for_mpid(mpr: MPRester, mpid: str, settings: QuizSettings) -> 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "cache_count": len(load_index()), "version": "17.0-render-fast", "recent_count": len(load_recent_history()), "memory_candidate_pools": {k: len(v) for k, v in MEMORY_CANDIDATE_POOLS.items()}, "memory_quiz_queues": {k: len(v) for k, v in MEMORY_QUIZ_QUEUES.items()}}
+    return {"ok": True, "cache_count": len(load_index()), "version": "8.0", "recent_count": len(load_recent_history())}
 
 
 @app.post("/api/quiz/new")
@@ -1427,66 +833,24 @@ def new_quiz(settings: QuizSettings):
         if settings.cache_only:
             raise HTTPException(status_code=404, detail="条件に合うキャッシュがありません。cache only をOFFにしてください。")
 
-    # Fast path on Render: serve a pre-generated in-memory quiz for the same
-    # settings if available.  This does not rely on persistent disk cache and
-    # avoids showing the same material repeatedly because each queued quiz is popped.
-    queued = pop_queued_quiz(settings) if settings.fast_mode else None
-    if queued is not None:
-        add_recent_mpid(queued["secret"]["mpid"], settings.recent_limit)
-        maybe_refill_quiz_queue(settings, count=2)
-        out = public_payload(queued)
-        out["from_memory_queue"] = True
-        return out
-
     key = get_api_key(settings.api_key)
-    errors: List[str] = []
+    errors = []
     with MPRester(key) as mpr:
-        # Multiple independent search rounds greatly reduce intermittent failure.
-        total_trials = max(1, int(settings.max_trials))
-        tried = set()
-        for round_index in range(2):
-            candidates = search_candidates(mpr, settings)
-            if not candidates:
-                errors.append(f"round {round_index+1}: 条件に合う候補がありません")
-                continue
-            for mpid in candidates:
-                if mpid in tried:
-                    continue
-                tried.add(mpid)
-                if len(tried) > total_trials * 5:
-                    break
-                try:
-                    payload = generate_quiz_for_mpid(mpr, mpid, settings)
-                    save_quiz_cache(payload, add_to_index=settings.save_cache)
-                    add_recent_mpid(mpid, settings.recent_limit)
-                    maybe_refill_quiz_queue(settings, count=2)
-                    return public_payload(payload)
-                except Exception as exc:
-                    errors.append(f"{mpid}: {exc}")
-                    continue
-    detail = "条件を緩めるか、軌道/電子系フィルタを変更してください。最後の失敗: " + " | ".join(errors[-8:])
-    raise HTTPException(status_code=502, detail=detail)
-
-
-@app.post("/api/quiz/search")
-def quiz_from_search(req: SearchQuizRequest):
-    settings = req.settings
-    key = get_api_key(settings.api_key)
-    errors: List[str] = []
-    with MPRester(key) as mpr:
-        mpids = search_material_ids(mpr, req.query, settings, limit=max(10, int(settings.max_trials)))
-        if not mpids:
-            raise HTTPException(status_code=404, detail="検索条件に合う物質が見つかりませんでした。mp-id、化学式、元素記号、または Fe-O のような化学系で検索してください。")
-        for mpid in mpids:
+        candidates = search_candidates(mpr, settings)
+        if not candidates:
+            raise HTTPException(status_code=404, detail="条件に合う MP 候補が見つかりませんでした。条件を緩めてください。")
+        for i, mpid in enumerate(candidates[: max(1, settings.max_trials)]):
             try:
                 payload = generate_quiz_for_mpid(mpr, mpid, settings)
+                # Always write a per-session quiz file so /check and /reveal work.
+                # Only add it to the reusable quiz cache index when save_cache=True.
                 save_quiz_cache(payload, add_to_index=settings.save_cache)
                 add_recent_mpid(mpid, settings.recent_limit)
                 return public_payload(payload)
             except Exception as exc:
                 errors.append(f"{mpid}: {exc}")
                 continue
-    raise HTTPException(status_code=502, detail="検索候補は見つかりましたが、band/DOS の取得または軌道条件で失敗しました: " + " | ".join(errors[-8:]))
+    raise HTTPException(status_code=500, detail="band/DOS を取得できる候補が見つかりませんでした: " + " | ".join(errors[-5:]))
 
 
 @app.post("/api/cache/prefetch")
@@ -1571,12 +935,6 @@ def clear_candidate_cache():
             pass
     return {"ok": True, "message": "candidate cache cleared"}
 
-
-
-@app.head("/")
-def head_root():
-    # Render health checks may use HEAD.  Returning 200 avoids misleading 405 logs.
-    return JSONResponse(content=None, status_code=200)
 
 # ============================================================
 # Static frontend serving
