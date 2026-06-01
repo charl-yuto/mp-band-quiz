@@ -13,6 +13,12 @@ const DEFAULT_SETTINGS = {
   nelements_min: 1,
   nelements_max: 3,
   path_type: 'hinuma',
+  electron_system: 'any',
+  selected_orbitals: ['s', 'p', 'd', 'f'],
+  exclude_f_block: false,
+  exclude_missing_f_dos: true,
+  random_element_search: true,
+  random_element_seed_count: 6,
   prefer_cache: false,
   cache_only: false,
   save_cache: false,
@@ -22,7 +28,7 @@ const DEFAULT_SETTINGS = {
   refresh_candidate_pool: true,
   candidate_pool_size: 120,
   candidate_num_chunks: 1,
-  max_trials: 6,
+  max_trials: 18,
   avoid_recent: true,
   recent_limit: 1000,
   energy_min: -8,
@@ -124,6 +130,13 @@ function NumberInput({ value, onChange, step = 1, min, max }) {
 }
 function Toggle({ label, checked, onChange, help }) {
   return <button className={'toggle ' + (checked ? 'on' : '')} onClick={() => onChange(!checked)} type="button"><span>{label}{help && <small>{help}</small>}</span><b>{checked ? 'ON' : 'OFF'}</b></button>
+}
+
+function OrbitalToggle({ orbital, checked, onChange }) {
+  const color = ORBITAL_COLORS[orbital] || '#64748b'
+  return <button className={'orbitalToggle ' + (checked ? 'on' : '')} style={{ '--orb': color }} onClick={() => onChange(!checked)} type="button">
+    <b>{orbital}</b><span>{checked ? '表示/条件に使う' : '除外'}</span>
+  </button>
 }
 function Field({ label, children, note }) {
   return <label className="field"><span>{label}</span>{children}{note && <small>{note}</small>}</label>
@@ -246,6 +259,7 @@ export default function App() {
   const [view, setView] = useState(DEFAULT_VIEW)
   const [quiz, setQuiz] = useState(null)
   const [answer, setAnswer] = useState('')
+  const [searchQuery, setSearchQuery] = useState('')
   const [result, setResult] = useState(null)
   const [revealed, setRevealed] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -280,6 +294,28 @@ export default function App() {
     finally { setLoading(false) }
   }
 
+  async function searchQuiz() {
+    if (!searchQuery.trim()) { setError('検索語を入力してください。例: mp-149, Si, Fe2O3, Fe-O'); return }
+    setLoading(true); setError(''); setResult(null); setRevealed(null); setAnswer('')
+    const t0 = performance.now()
+    try {
+      const data = await apiPost('/api/quiz/search', { query: searchQuery.trim(), settings })
+      setQuiz(data)
+      setLastInfo(`検索取得 ${((performance.now()-t0)/1000).toFixed(2)} 秒 / backend ${data.timing_sec ?? '?'} 秒`)
+      refreshCacheCount()
+    } catch (e) { setError(e.message) }
+    finally { setLoading(false) }
+  }
+
+  function setOrbitalEnabled(orb, enabled) {
+    setSettings(s => {
+      const cur = new Set(s.selected_orbitals || ['s','p','d','f'])
+      if (enabled) cur.add(orb); else cur.delete(orb)
+      const arr = ['s','p','d','f'].filter(x => cur.has(x))
+      return { ...s, selected_orbitals: arr.length ? arr : [orb] }
+    })
+  }
+
   async function check() {
     if (!quiz) return
     setError('')
@@ -299,12 +335,12 @@ export default function App() {
   return <div className="app">
     <header className="topbar">
       <div>
-        <span className="badge">MP Band Quiz v8</span>
+        <span className="badge">MP Band Quiz v13</span>
         <h1>バンド図・DOS クイズ</h1>
-        <p>MP の実データを使い、匿名組成式・結晶情報・band/DOS から物質を当てます。候補検索を軽くし、問題キャッシュなしでランダム出題します。</p>
+        <p>MP の実データを使い、匿名組成式・結晶情報・band/DOS から物質を当てます。v8の可動UIを維持しつつ、複数ランダム元素シードで偏りを減らし、軌道選択・検索出題にも対応しています。</p>
       </div>
       <div className="topActions">
-        <button className="primary" onClick={() => newQuiz(false)} disabled={loading}>{loading ? '取得中...' : 'ライブランダム出題'}</button>
+        <button className="primary" onClick={() => newQuiz(false)} disabled={loading}>{loading ? '取得中...' : 'ランダム出題'}</button>
         <button onClick={() => newQuiz(false, { refresh_candidate_pool: true, use_candidate_cache: false })} disabled={loading}>候補を再検索して出題</button>
       </div>
     </header>
@@ -322,6 +358,7 @@ export default function App() {
             <div><span>空間群</span><b>{hint.spacegroup_symbol || '-'} No. {hint.spacegroup_number || '-'}</b></div>
             <div><span>サイト数</span><b>{hint.nsites ?? '-'}</b></div>
             <div><span>性質</span><b>{hint.is_metal ? 'metal' : 'nonmetal'}</b></div>
+            {hint.contains_f_block && <div className={hint.f_core_like ? 'fStatus warn' : 'fStatus ok'}><span>f-DOS</span><b>{hint.f_core_like ? 'f欠損/ core扱い可能性' : 'f成分あり'}</b><small>{hint.f_dos_note}</small></div>}
           </div> : <div className="hintBox blank">まだ出題されていません。</div>}
           <div className="answerRow"><input value={answer} onChange={e=>{setAnswer(e.target.value); setResult(null)}} onKeyDown={e=>{if(e.key==='Enter') check()}} placeholder="例: Cr, Si, H2O" /><button onClick={check} disabled={!quiz}>回答</button></div>
           <div className="answerTools"><button onClick={reveal} disabled={!quiz}>答え表示</button><button onClick={() => {setAnswer(''); setResult(null); setRevealed(null)}} disabled={!quiz}>もう一度</button></div>
@@ -330,21 +367,31 @@ export default function App() {
           {revealed && <div className="reveal">答え: <b>{revealed.answer}</b><br/>MP-ID: {revealed.mpid}<br/>A対応: {JSON.stringify(revealed.alias_map)}</div>}
         </div>
 
+        <SettingsCard title="検索して出題" desc="mp-id、化学式、元素記号、化学系から指定して出題できます。">
+          <div className="searchRow"><input value={searchQuery} onChange={e=>setSearchQuery(e.target.value)} onKeyDown={e=>{if(e.key==='Enter') searchQuiz()}} placeholder="例: mp-149, Si, Fe2O3, Fe-O" /><button onClick={searchQuiz} disabled={loading}>検索して出題</button></div>
+          <p className="smallNote">検索時も下の出題条件・軌道条件を適用します。</p>
+        </SettingsCard>
+
         <SettingsCard title="出題条件" desc="ここだけが MP 検索に効きます。">
           <Field label="MP API key"><input type="password" value={settings.api_key} onChange={e=>setS('api_key', e.target.value)} placeholder="空ならサーバー側 MP_API_KEY" /></Field>
           <div className="grid2"><Field label="種類"><Select value={settings.material_kind} onChange={v=>setS('material_kind', v)} options={[{value:'any',label:'なんでも'},{value:'element',label:'単体のみ'},{value:'compound',label:'化合物のみ'}]} /></Field><Field label="金属性"><Select value={settings.metallicity} onChange={v=>setS('metallicity', v)} options={[{value:'any',label:'なんでも'},{value:'metal',label:'金属のみ'},{value:'nonmetal',label:'非金属のみ'}]} /></Field></div>
           <div className="grid2"><Field label="安定性"><Select value={settings.stability} onChange={v=>setS('stability', v)} options={[{value:'stable_only',label:'安定のみ'},{value:'any',label:'問わない'}]} /></Field><Field label="k-path"><Select value={settings.path_type} onChange={v=>setS('path_type', v)} options={[{value:'hinuma',label:'Hinuma'},{value:'setyawan_curtarolo',label:'Setyawan-Curtarolo'},{value:'latimer_munro',label:'Latimer-Munro'}]} /></Field></div>
           <div className="grid2"><Field label="元素数 min"><NumberInput value={settings.nelements_min} onChange={v=>setS('nelements_min',v)} min={1}/></Field><Field label="元素数 max"><NumberInput value={settings.nelements_max} onChange={v=>setS('nelements_max',v)} min={1}/></Field></div>
+          <Field label="電子系"><Select value={settings.electron_system} onChange={v=>setS('electron_system', v)} options={[{value:'any',label:'なんでも'},{value:'sp',label:'s/p系のみ'},{value:'d',label:'d電子系のみ'},{value:'f',label:'f電子系のみ'},{value:'exclude_f_block',label:'fブロック除外'}]} /></Field>
+          <div className="orbitalBox"><span>表示・判定に使う軌道</span><div className="orbitalGrid">{['s','p','d','f'].map(o => <OrbitalToggle key={o} orbital={o} checked={(settings.selected_orbitals || []).includes(o)} onChange={v=>setOrbitalEnabled(o, v)} />)}</div></div>
+          <div className="switchRow"><Toggle label="希土類・アクチノイド除外" checked={settings.exclude_f_block} onChange={v=>setS('exclude_f_block', v)} /><Toggle label="f-DOS欠損を除外" checked={settings.exclude_missing_f_dos} onChange={v=>setS('exclude_missing_f_dos', v)} help="Dy等でfが出ない問題を避ける" /></div>
         </SettingsCard>
 
         <SettingsCard title="検索高速化" desc="問題の丸ごとキャッシュや事前取得は使わず、MP検索そのものを軽くします。">
           <Toggle label="band/DOSがある候補に絞る" checked={settings.require_band_dos_props} onChange={v=>setS('require_band_dos_props', v)} help="失敗候補を減らす。通常ON推奨" />
+          <Toggle label="複数ランダム元素で探す" checked={settings.random_element_search} onChange={v=>setS('random_element_search', v)} help="ランダム性を上げる。通常ON推奨" />
           <Toggle label="最近出た物質を避ける" checked={settings.avoid_recent} onChange={v=>setS('avoid_recent', v)} help="同じmp-idの連続出題を避ける" />
           <Toggle label="候補リストを保存" checked={settings.use_candidate_cache} onChange={v=>setS('use_candidate_cache', v)} help="mp-id一覧だけ保存。OFFなら毎回MPを探しに行く" />
           <Toggle label="候補リストを毎回作り直す" checked={settings.refresh_candidate_pool} onChange={v=>setS('refresh_candidate_pool', v)} help="候補リスト保存ONのときだけ意味があります" />
           <div className="grid2"><Field label="候補数"><NumberInput value={settings.candidate_pool_size} onChange={v=>setS('candidate_pool_size',v)} min={20}/></Field><Field label="候補チャンク数"><NumberInput value={settings.candidate_num_chunks} onChange={v=>setS('candidate_num_chunks',v)} min={1} max={20}/></Field></div>
-          <div className="grid2"><Field label="試行数"><NumberInput value={settings.max_trials} onChange={v=>setS('max_trials',v)} min={1}/></Field><Field label="最近回避数"><NumberInput value={settings.recent_limit} onChange={v=>setS('recent_limit',v)} min={10}/></Field></div>
-          <p className="smallNote">推奨: band/DOS候補絞りON、候補数80〜150、チャンク数1、試行数4〜8。キャッシュを使わずランダム性を保つ設定です。</p>
+          <div className="grid2"><Field label="試行数"><NumberInput value={settings.max_trials} onChange={v=>setS('max_trials',v)} min={1}/></Field><Field label="元素シード数"><NumberInput value={settings.random_element_seed_count} onChange={v=>setS('random_element_seed_count',v)} min={1} max={16}/></Field></div>
+          <Field label="最近回避数"><NumberInput value={settings.recent_limit} onChange={v=>setS('recent_limit',v)} min={10}/></Field>
+          <p className="smallNote">推奨: 複数ランダム元素ON、元素シード数4〜8、候補数100〜200、試行数12〜24。問題キャッシュなしで偏りを減らします。</p>
         </SettingsCard>
       </section>
 

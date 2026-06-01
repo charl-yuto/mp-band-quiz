@@ -1,89 +1,64 @@
-# MP Band Quiz v8
+# MP Band Quiz v8 Search + Electronic System
 
-v8 は「問題キャッシュや事前取得でランダム性が落ちる」問題を避けるため、**デフォルトで完全な問題キャッシュを使いません**。
+This is a v8-style MP Band Quiz app with:
 
-## 何を速くしたか
+- Interactive Plotly band structure / DOS / crystal structure / BZ-kpath UI
+- Random quiz mode
+- Search quiz mode: `mp-149`, `Si`, `Fe2O3`, `Fe-O`, etc.
+- Electron-system filter:
+  - any
+  - s/p system
+  - d-electron system
+  - f-electron system
+  - exclude f-block
+- Orbital selector for DOS display/filtering: `s`, `p`, `d`, `f`
+- f-block diagnostic:
+  - detects when a rare-earth/actinide element is present
+  - detects whether MP projected DOS actually contains f-DOS
+  - can exclude materials where f-DOS is missing, which often means f electrons were treated as core-like or were not included in the stored projection
+- GitHub / Render ready: Dockerfile and render.yaml included
 
-- `has_props=["bandstructure", "dos"]` を使える環境では、band/DOS を持つ候補だけに絞ります。
-- 候補数の既定値を軽くしました。
-- 失敗候補を減らすため、候補検索を先に軽く絞ります。
-- バンド/DOS は Plotly/JSON で描画し、エネルギー範囲変更は frontend だけで反映します。
-- 数値入力を `type="text"` にし、`-3` のような負の数を自然に入力できるようにしました。
+## Local one-URL mode
 
-## 推奨設定
+```bash
+cd mp_band_quiz_real_v8_search_electronic
+export MP_API_KEY='your_materials_project_api_key'
+PORT=8010 ./run_one_url.sh
+```
 
-画面の「検索高速化」では、まず以下を推奨します。
+Open:
 
 ```text
-band/DOSがある候補に絞る: ON
-最近出た物質を避ける: ON
-候補リストを保存: OFF
-候補リストを毎回作り直す: ON
-候補数: 80〜150
-候補チャンク数: 1
-試行数: 4〜8
+http://127.0.0.1:8010/
 ```
 
-この設定は、問題キャッシュや事前取得を使わずに、なるべくランダム性を保ったまま検索を軽くする設定です。
+## Render deployment
 
-## 起動
-
-```bash
-cd ~/material/mp_band_quiz_real_v8
-export MP_API_KEY='your_api_key'
-./run_one_url.sh
-```
-
-ブラウザで:
+Push this directory to GitHub, then create a Render Web Service from the repository.
+Use the included Dockerfile. Set this environment variable in Render:
 
 ```text
-http://127.0.0.1:8000/
+MP_API_KEY = your_materials_project_api_key
 ```
 
-## 外部 URL 共有
+For Docker deployment, build/start commands can be empty because the Dockerfile defines them.
 
-```bash
-cd ~/material/mp_band_quiz_real_v8
-export MP_API_KEY='your_api_key'
-./run_public_cloudflare.sh
+## Recommended quiz settings
+
+For fair material-identification quizzes:
+
+```text
+電子系: なんでも / d電子系のみ / s/p系のみ
+希土類・アクチノイド除外: ON for beginner mode
+f-DOS欠損を除外: ON
+表示・判定に使う軌道: s,p,d,f all ON unless you intentionally hide some orbitals
 ```
 
-表示された `https://...trycloudflare.com` を共有してください。
+For f-electron quizzes:
 
-## cloudflared がない場合
-
-```bash
-./install_cloudflared_user.sh
-source ~/.bashrc
-cloudflared --version
+```text
+電子系: f電子系のみ
+希土類・アクチノイド除外: OFF
+f-DOS欠損を除外: ON
+軌道: f ON
 ```
-
-## 既存キャッシュを消したい場合
-
-```bash
-cd ~/material/mp_band_quiz_real_v8
-rm -rf backend/cache/quizzes backend/cache/index.json
-rm -rf backend/cache/candidate_pools
-rm -f backend/cache/recent_history.json
-```
-
-## 設定の意味
-
-### 出題条件
-
-- 種類: 単体/化合物/なんでも
-- 金属性: 金属/非金属/なんでも
-- 安定性: 安定のみ/問わない
-- 元素数 min/max
-- k-path convention
-
-### 検索高速化
-
-- band/DOSがある候補に絞る: `has_props` を使って、失敗候補を減らします。通常 ON。
-- 最近出た物質を避ける: 直近の mp-id を避けます。
-- 候補リストを保存: mp-id 一覧だけ保存します。ランダム性重視なら OFF。
-- 候補リストを毎回作り直す: 保存済み候補リストを使わずに再検索します。
-- 候補数: summary 検索で取る候補数。大きいほど候補は増えますが遅くなります。
-- 候補チャンク数: 候補数をさらに増やします。まずは 1 推奨。
-- 試行数: band/DOS が取れる候補を試す最大回数。
-

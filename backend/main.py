@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import secrets
 import re
 import time
 import traceback
@@ -12,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -20,7 +21,7 @@ from scipy.spatial import Voronoi
 
 from mp_api.client import MPRester
 from emmet.core.electronic_structure import BSPathType
-from pymatgen.core import Element
+from pymatgen.core import Element, Composition
 from pymatgen.electronic_structure.core import OrbitalType, Spin
 from pymatgen.electronic_structure.plotter import BSPlotter
 
@@ -47,7 +48,7 @@ CANDIDATE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 # FastAPI setup
 # ============================================================
 
-app = FastAPI(title="MP Band Quiz", version="8.0")
+app = FastAPI(title="MP Band Quiz", version="13.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -86,6 +87,18 @@ class QuizSettings(BaseModel):
 
     path_type: str = "hinuma"
 
+    # Electronic/orbital filters
+    # electron_system: any, sp, d, f, exclude_f_block
+    electron_system: str = "any"
+    selected_orbitals: List[str] = Field(default_factory=lambda: ["s", "p", "d", "f"])
+    exclude_f_block: bool = False
+    exclude_missing_f_dos: bool = True
+
+    # Search randomization.  Multiple random element seeds reduce the bias of
+    # repeated MP summary.search calls while still avoiding full quiz cache.
+    random_element_search: bool = True
+    random_element_seed_count: int = 6
+
     # Speed / randomization
     # v8 default is LIVE RANDOM: do not reuse full quiz cache and do not prefetch.
     # The only acceleration is a faster MP summary query and optional lightweight
@@ -106,7 +119,7 @@ class QuizSettings(BaseModel):
     refresh_candidate_pool: bool = True
     candidate_pool_size: int = 120
     candidate_num_chunks: int = 1
-    max_trials: int = 6
+    max_trials: int = 18
 
     # Avoid repeating recently shown materials.
     avoid_recent: bool = True
@@ -129,6 +142,11 @@ class RevealRequest(BaseModel):
 
 class PrefetchRequest(BaseModel):
     count: int = 5
+    settings: QuizSettings
+
+
+class SearchQuizRequest(BaseModel):
+    query: str
     settings: QuizSettings
 
 
@@ -301,6 +319,10 @@ def settings_candidate_key(settings: QuizSettings) -> str:
         "pool_size": settings.candidate_pool_size,
         "num_chunks": settings.candidate_num_chunks,
         "require_band_dos_props": settings.require_band_dos_props,
+        "electron_system": settings.electron_system,
+        "exclude_f_block": settings.exclude_f_block,
+        "exclude_missing_f_dos": settings.exclude_missing_f_dos,
+        "random_element_seed_count": settings.random_element_seed_count,
     }
     raw = json.dumps(key, sort_keys=True, ensure_ascii=False)
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw)[:160]
@@ -337,14 +359,148 @@ def save_candidate_pool(settings: QuizSettings, material_ids: List[str]):
 
 
 def choose_candidate_order(material_ids: List[str], settings: QuizSettings) -> List[str]:
+    rng = secrets.SystemRandom()
     ids = list(dict.fromkeys([str(x) for x in material_ids]))
     if settings.avoid_recent:
         recent = set(load_recent_history()[: max(1, int(settings.recent_limit))])
         fresh = [x for x in ids if x not in recent]
         if fresh:
             ids = fresh
-    random.shuffle(ids)
+    rng.shuffle(ids)
     return ids
+
+
+F_BLOCK_SYMBOLS = {
+    "La", "Ce", "Pr", "Nd", "Pm", "Sm", "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu",
+    "Ac", "Th", "Pa", "U", "Np", "Pu", "Am", "Cm", "Bk", "Cf", "Es", "Fm", "Md", "No", "Lr",
+}
+D_BLOCK_SYMBOLS = {
+    "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn",
+    "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd",
+    "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg",
+}
+SP_BLOCK_SYMBOLS = {
+    "H", "Li", "Be", "B", "C", "N", "O", "F", "Ne",
+    "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar",
+    "K", "Ca", "Ga", "Ge", "As", "Se", "Br", "Kr",
+    "Rb", "Sr", "In", "Sn", "Sb", "Te", "I", "Xe",
+    "Cs", "Ba", "Tl", "Pb", "Bi", "Po", "At", "Rn",
+}
+COMMON_RANDOM_SYMBOLS = sorted(SP_BLOCK_SYMBOLS | D_BLOCK_SYMBOLS | F_BLOCK_SYMBOLS)
+
+
+def valid_element_symbols_from_doc(doc: Any) -> List[str]:
+    elems = safe_attr(doc, "elements", None)
+    out: List[str] = []
+    if elems:
+        for e in elems:
+            try:
+                out.append(str(getattr(e, "symbol", e)))
+            except Exception:
+                pass
+    if out:
+        return out
+    formula = safe_attr(doc, "formula_pretty", None)
+    if formula:
+        try:
+            return [str(el) for el in Composition(str(formula)).elements]
+        except Exception:
+            return []
+    return []
+
+
+def is_f_block_symbol(sym: str) -> bool:
+    return str(sym) in F_BLOCK_SYMBOLS
+
+
+def allowed_seed_symbols(settings: QuizSettings) -> List[str]:
+    mode = str(settings.electron_system or "any")
+    if mode == "d":
+        syms = sorted(D_BLOCK_SYMBOLS)
+    elif mode == "f":
+        syms = sorted(F_BLOCK_SYMBOLS)
+    elif mode == "sp":
+        syms = sorted(SP_BLOCK_SYMBOLS)
+    elif mode == "exclude_f_block" or settings.exclude_f_block:
+        syms = sorted((SP_BLOCK_SYMBOLS | D_BLOCK_SYMBOLS) - F_BLOCK_SYMBOLS)
+    else:
+        syms = COMMON_RANDOM_SYMBOLS
+    return syms
+
+
+def summary_doc_matches_filters(doc: Any, settings: QuizSettings) -> bool:
+    ne = safe_attr(doc, "nelements", None)
+    try:
+        ne = int(ne)
+    except Exception:
+        return False
+    if not (settings.nelements_min <= ne <= settings.nelements_max):
+        return False
+    if settings.material_kind == "element" and ne != 1:
+        return False
+    if settings.material_kind == "compound" and ne <= 1:
+        return False
+    if settings.metallicity == "metal" and safe_attr(doc, "is_metal", None) is not True:
+        return False
+    if settings.metallicity == "nonmetal" and safe_attr(doc, "is_metal", None) is not False:
+        return False
+    if settings.stability == "stable_only" and safe_attr(doc, "is_stable", None) is not True:
+        return False
+    elems = valid_element_symbols_from_doc(doc)
+    has_f_block = any(is_f_block_symbol(e) for e in elems)
+    if settings.exclude_f_block or settings.electron_system == "exclude_f_block":
+        if has_f_block:
+            return False
+    # Coarse prefilters.  Final decision for d/f/sp is made after DOS is read.
+    if settings.electron_system == "d" and not any(e in D_BLOCK_SYMBOLS for e in elems):
+        return False
+    if settings.electron_system == "f" and not has_f_block:
+        return False
+    if settings.electron_system == "sp" and any((e in D_BLOCK_SYMBOLS or e in F_BLOCK_SYMBOLS) for e in elems):
+        return False
+    return True
+
+
+def orbital_weights_from_curves(curves: List[Dict[str, Any]]) -> Dict[str, float]:
+    weights = {"s": 0.0, "p": 0.0, "d": 0.0, "f": 0.0}
+    for c in curves or []:
+        orb = str(c.get("orbital", ""))
+        y = c.get("y") or []
+        if orb in weights:
+            try:
+                weights[orb] += float(np.nansum(np.abs(np.asarray(y, dtype=float))))
+            except Exception:
+                pass
+    return weights
+
+
+def payload_matches_orbital_filters(payload: Dict[str, Any], settings: QuizSettings) -> Tuple[bool, str]:
+    curves = payload.get("dos", {}).get("curves", [])
+    if not curves:
+        return False, "DOS curve が空です"
+    allowed = {str(x).lower() for x in (settings.selected_orbitals or ["s", "p", "d", "f"])}
+    if allowed:
+        curves = [c for c in curves if str(c.get("orbital", "")).lower() in allowed]
+        payload["dos"]["curves"] = curves
+    if not curves:
+        return False, "選択軌道に対応するDOSがありません"
+    weights = orbital_weights_from_curves(curves)
+    total = sum(weights.values())
+    if total <= 0:
+        return False, "DOS weight がゼロです"
+    mode = str(settings.electron_system or "any")
+    if mode == "d" and weights.get("d", 0.0) <= 0:
+        return False, "d-DOS がありません"
+    if mode == "f" and weights.get("f", 0.0) <= 0:
+        return False, "f-DOS がありません"
+    if mode == "sp" and (weights.get("d", 0.0) + weights.get("f", 0.0)) > 0.35 * total:
+        return False, "s/p系としては d/f 成分が大きすぎます"
+    hint = payload.get("hint", {})
+    contains_f_block = bool(hint.get("contains_f_block"))
+    has_f_dos = bool(hint.get("has_f_dos"))
+    if settings.exclude_missing_f_dos and contains_f_block and not has_f_dos:
+        return False, "fブロック元素を含みますが、MP projected DOS に f 成分がありません"
+    return True, ""
 
 
 def cache_path(quiz_id: str) -> Path:
@@ -441,7 +597,68 @@ def element_order_from_structure(structure) -> List[str]:
         return []
 
 
-def get_element_orbital_dos(dos, alias_map: Dict[str, str], energy_min: float, energy_max: float, padding: float) -> Tuple[List[float], List[Dict[str, Any]], List[Dict[str, str]]]:
+def f_dos_diagnostics(dos, structure=None) -> Dict[str, Any]:
+    """Diagnose whether f-block elements have projected f-DOS.
+
+    This is intentionally independent of the user's selected_orbitals.
+    If a material contains a rare-earth/actinide element but no f-projected
+    DOS is present in the MP data, the f electrons may have been treated as
+    core-like or simply not included in the stored projection.
+    """
+    structure = structure or getattr(dos, "structure", None)
+    elems = []
+    try:
+        elems = [str(e) for e in structure.composition.elements]
+    except Exception:
+        elems = []
+    f_block_elements = [e for e in elems if is_f_block_symbol(e)]
+    f_dos_elements = []
+    missing_f_dos_elements = []
+
+    for elem_symbol in f_block_elements:
+        try:
+            elem = Element(elem_symbol)
+            elem_spd = dos.get_element_spd_dos(elem)
+        except Exception:
+            try:
+                elem_spd = dos.get_element_spd_dos(elem_symbol)
+            except Exception:
+                missing_f_dos_elements.append(elem_symbol)
+                continue
+        has_f = False
+        for orb, pdos in elem_spd.items():
+            if orbital_type_to_label(orb) != "f":
+                continue
+            dens = sum_spin_densities(pdos.densities)
+            if dens.size and np.nanmax(np.abs(dens)) > 1e-12:
+                has_f = True
+                break
+        if has_f:
+            f_dos_elements.append(elem_symbol)
+        else:
+            missing_f_dos_elements.append(elem_symbol)
+
+    contains = len(f_block_elements) > 0
+    has_f = len(f_dos_elements) > 0
+    core_like = contains and not has_f
+    if not contains:
+        note = "fブロック元素は含まれていません。"
+    elif has_f:
+        note = "fブロック元素を含み、MPのprojected DOSにf成分があります。"
+    else:
+        note = "fブロック元素を含みますが、MPのprojected DOSにf成分がありません。4f/5fがcore扱い、または射影DOSに含まれていない可能性があります。"
+    return {
+        "contains_f_block": contains,
+        "f_block_elements": f_block_elements,
+        "has_f_dos": has_f,
+        "f_dos_elements": f_dos_elements,
+        "missing_f_dos_elements": missing_f_dos_elements,
+        "f_core_like": core_like,
+        "f_dos_note": note,
+    }
+
+
+def get_element_orbital_dos(dos, alias_map: Dict[str, str], energy_min: float, energy_max: float, padding: float, selected_orbitals: Optional[List[str]] = None) -> Tuple[List[float], List[Dict[str, Any]], List[Dict[str, str]]]:
     energies = np.asarray(dos.energies, dtype=float) - float(dos.efermi)
     lo = energy_min - padding
     hi = energy_max + padding
@@ -450,6 +667,7 @@ def get_element_orbital_dos(dos, alias_map: Dict[str, str], energy_min: float, e
         mask = np.ones_like(energies, dtype=bool)
 
     order = element_order_from_structure(dos.structure)
+    allowed_orbs = {str(x).lower() for x in (selected_orbitals or ["s", "p", "d", "f"])}
     out = []
     label_map = []
 
@@ -471,7 +689,7 @@ def get_element_orbital_dos(dos, alias_map: Dict[str, str], energy_min: float, e
                 tmp[orb_label] = dens[mask].tolist()
 
         for orb_label in ["s", "p", "d", "f"]:
-            if orb_label in tmp:
+            if orb_label in allowed_orbs and orb_label in tmp:
                 true_label = f"{elem_symbol} {orb_label}"
                 shown = display_label(true_label, alias_map)
                 out.append({"true_label": true_label, "label": shown, "orbital": orb_label, "element": elem_symbol, "y": tmp[orb_label]})
@@ -483,7 +701,7 @@ def get_element_orbital_dos(dos, alias_map: Dict[str, str], energy_min: float, e
             for orb, pdos in dos.get_spd_dos().items():
                 orb_label = orbital_type_to_label(orb)
                 dens = sum_spin_densities(pdos.densities)
-                if dens.size and np.nanmax(np.abs(dens)) > 1e-12:
+                if orb_label in allowed_orbs and dens.size and np.nanmax(np.abs(dens)) > 1e-12:
                     out.append({"true_label": orb_label, "label": orb_label, "orbital": orb_label, "element": "", "y": dens[mask].tolist()})
         except Exception:
             pass
@@ -648,6 +866,7 @@ def summary_to_hint(doc) -> Dict[str, Any]:
         "spacegroup_symbol": safe_attr(sym, "symbol", None),
         "spacegroup_number": safe_attr(sym, "number", None),
         "point_group": safe_attr(sym, "point_group", None),
+        "elements": [str(getattr(e, "symbol", e)) for e in (safe_attr(doc, "elements", None) or [])],
     }
     for k, v in list(info.items()):
         if v is not None and not isinstance(v, (str, int, float, bool)):
@@ -661,7 +880,7 @@ def get_summary(mpr: MPRester, mpid: str):
         fields=[
             "material_id", "formula_pretty", "formula_anonymous", "symmetry",
             "nsites", "is_metal", "band_gap", "nelements", "is_stable",
-            "energy_above_hull", "structure",
+            "energy_above_hull", "elements", "structure",
         ],
     )
     if not docs:
@@ -669,23 +888,42 @@ def get_summary(mpr: MPRester, mpid: str):
     return docs[0]
 
 
-def search_candidates(mpr: MPRester, settings: QuizSettings) -> List[str]:
-    """Return randomized candidate mp-ids using a lightweight summary query.
+def _summary_search_once(mpr: MPRester, kwargs: Dict[str, Any]) -> List[Any]:
+    try:
+        return list(mpr.materials.summary.search(**kwargs))
+    except Exception as exc:
+        # Fall back if has_props is not accepted by the installed mp-api/server.
+        if "has_props" in kwargs:
+            kw2 = dict(kwargs)
+            kw2.pop("has_props", None)
+            return list(mpr.materials.summary.search(**kw2))
+        raise exc
 
-    v8 intentionally avoids full problem prefetch/cache by default.  Speed is
-    improved by asking MP summary for materials that have bandstructure and DOS
-    when the local mp-api supports the has_props filter.
+
+def search_candidates(mpr: MPRester, settings: QuizSettings) -> List[str]:
+    """Return a much less biased randomized candidate list.
+
+    v13 keeps the v8 UI/flow but fixes the weak randomness by doing several
+    independent element-seeded summary searches, merging the results, removing
+    duplicates, and shuffling with secrets.SystemRandom.
     """
     if settings.use_candidate_cache:
         cached = load_candidate_pool(settings)
         if cached:
             return choose_candidate_order(cached, settings)
 
+    rng = secrets.SystemRandom()
     fields = [
         "material_id", "formula_pretty", "formula_anonymous", "symmetry",
         "nsites", "is_metal", "band_gap", "nelements", "is_stable",
-        "energy_above_hull", "has_props",
+        "energy_above_hull", "elements", "has_props",
     ]
+    minimal_fields = [
+        "material_id", "formula_pretty", "formula_anonymous", "symmetry",
+        "nsites", "is_metal", "band_gap", "nelements", "is_stable",
+        "energy_above_hull", "elements",
+    ]
+
     chunk_size = max(20, min(int(settings.candidate_pool_size), 500))
     num_chunks = max(1, min(int(settings.candidate_num_chunks), 20))
 
@@ -700,59 +938,101 @@ def search_candidates(mpr: MPRester, settings: QuizSettings) -> List[str]:
         base_kwargs["is_metal"] = True
     elif settings.metallicity == "nonmetal":
         base_kwargs["is_metal"] = False
-
-    attempts: List[Dict[str, Any]] = []
     if settings.require_band_dos_props:
-        # Several mp-api versions accept strings here.  Some may require enum
-        # values, and older versions may not accept the kwarg at all.  Therefore
-        # we try and fall back cleanly.
-        attempts.append({**base_kwargs, "has_props": ["bandstructure", "dos"]})
-        attempts.append({**base_kwargs, "has_props": ["electronic_structure"]})
-    attempts.append(base_kwargs)
+        base_kwargs["has_props"] = ["bandstructure", "dos"]
 
+    query_kwargs: List[Dict[str, Any]] = []
+    if settings.random_element_search:
+        seeds = allowed_seed_symbols(settings)
+        rng.shuffle(seeds)
+        nseed = max(1, min(int(settings.random_element_seed_count), 16))
+        for sym in seeds[:nseed]:
+            query_kwargs.append({**base_kwargs, "elements": [sym]})
+    # Add one broad query as a safety net, but shuffle/merge means it no longer dominates.
+    query_kwargs.append(dict(base_kwargs))
+
+    docs: List[Any] = []
     last_exc: Optional[Exception] = None
-    docs = []
-    for kwargs in attempts:
+    for kwargs in query_kwargs:
         try:
-            docs = mpr.materials.summary.search(**kwargs)
-            break
+            docs.extend(_summary_search_once(mpr, kwargs))
         except Exception as exc:
             last_exc = exc
-            docs = []
-            continue
+            try:
+                kw2 = dict(kwargs)
+                kw2["fields"] = minimal_fields
+                kw2.pop("has_props", None)
+                docs.extend(list(mpr.materials.summary.search(**kw2)))
+            except Exception:
+                continue
+
     if not docs and last_exc is not None:
-        # one last minimal fallback without newer fields
-        minimal_fields = ["material_id", "formula_pretty", "formula_anonymous", "symmetry", "nsites", "is_metal", "band_gap", "nelements", "is_stable", "energy_above_hull"]
-        try:
-            docs = mpr.materials.summary.search(fields=minimal_fields, chunk_size=chunk_size, num_chunks=num_chunks)
-        except Exception:
-            raise last_exc
+        raise last_exc
 
-    candidates = []
+    rng.shuffle(docs)
+    candidates: List[str] = []
+    seen = set()
     for d in docs:
-        ne = safe_attr(d, "nelements", None)
-        try:
-            ne = int(ne)
-        except Exception:
+        if not summary_doc_matches_filters(d, settings):
             continue
-        if not (settings.nelements_min <= ne <= settings.nelements_max):
-            continue
-        if settings.material_kind == "element" and ne != 1:
-            continue
-        if settings.material_kind == "compound" and ne <= 1:
-            continue
-        if settings.metallicity == "metal" and safe_attr(d, "is_metal", None) is not True:
-            continue
-        if settings.metallicity == "nonmetal" and safe_attr(d, "is_metal", None) is not False:
-            continue
-        if settings.stability == "stable_only" and safe_attr(d, "is_stable", None) is not True:
-            continue
-        candidates.append(str(safe_attr(d, "material_id")))
+        mid = str(safe_attr(d, "material_id", ""))
+        if mid and mid not in seen:
+            seen.add(mid)
+            candidates.append(mid)
 
-    candidates = list(dict.fromkeys(candidates))
     if settings.use_candidate_cache and candidates:
         save_candidate_pool(settings, candidates)
     return choose_candidate_order(candidates, settings)
+
+
+def search_material_ids(mpr: MPRester, query: str, settings: QuizSettings, limit: int = 25) -> List[str]:
+    q = (query or "").strip()
+    if not q:
+        return []
+    if re.fullmatch(r"mp-\d+", q):
+        return [q]
+
+    fields = ["material_id", "formula_pretty", "formula_anonymous", "symmetry", "nsites", "is_metal", "band_gap", "nelements", "is_stable", "energy_above_hull", "elements"]
+    docs: List[Any] = []
+
+    def add_docs(**kwargs):
+        nonlocal docs
+        try:
+            docs.extend(list(mpr.materials.summary.search(fields=fields, chunk_size=min(max(limit, 20), 100), num_chunks=1, **kwargs)))
+        except Exception:
+            pass
+
+    # Formula search, e.g. Si, Fe2O3, SrTiO3.
+    add_docs(formula=q)
+    try:
+        comp = Composition(q)
+        add_docs(formula=str(comp.reduced_formula))
+        elems = [str(el) for el in comp.elements]
+        if elems:
+            add_docs(elements=elems)
+            add_docs(chemsys="-".join(sorted(elems)))
+    except Exception:
+        pass
+
+    # Element or chemical system search, e.g. O, Fe-O.
+    if re.fullmatch(r"[A-Z][a-z]?", q):
+        add_docs(elements=[q])
+    if "-" in q:
+        add_docs(chemsys=q)
+
+    out: List[str] = []
+    seen = set()
+    for d in docs:
+        if not summary_doc_matches_filters(d, settings):
+            continue
+        mid = str(safe_attr(d, "material_id", ""))
+        if mid and mid not in seen:
+            seen.add(mid)
+            out.append(mid)
+        if len(out) >= limit:
+            break
+    return out
+
 
 def generate_quiz_for_mpid(mpr: MPRester, mpid: str, settings: QuizSettings) -> Dict[str, Any]:
     start = time.time()
@@ -775,7 +1055,9 @@ def generate_quiz_for_mpid(mpr: MPRester, mpid: str, settings: QuizSettings) -> 
         energy_min=settings.energy_min,
         energy_max=settings.energy_max,
         padding=settings.data_energy_padding,
+        selected_orbitals=settings.selected_orbitals,
     )
+    f_diag = f_dos_diagnostics(dos, structure)
 
     band = band_data_from_bs(bs, settings.energy_min, settings.energy_max, settings.data_energy_padding)
     st = structure_data(structure)
@@ -796,6 +1078,7 @@ def generate_quiz_for_mpid(mpr: MPRester, mpid: str, settings: QuizSettings) -> 
         "settings_used": settings.model_dump(),
         "hint": {
             **hint,
+            **f_diag,
             "anonymous_formula": hint.get("formula_anonymous") or structure.composition.anonymized_formula,
             "path_type": settings.path_type,
         },
@@ -812,6 +1095,9 @@ def generate_quiz_for_mpid(mpr: MPRester, mpid: str, settings: QuizSettings) -> 
             "alias_map": alias_map,
         },
     }
+    ok, reason = payload_matches_orbital_filters(payload, settings)
+    if not ok:
+        raise RuntimeError(reason)
     return payload
 
 
@@ -821,7 +1107,12 @@ def generate_quiz_for_mpid(mpr: MPRester, mpid: str, settings: QuizSettings) -> 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "cache_count": len(load_index()), "version": "8.0", "recent_count": len(load_recent_history())}
+    return {"ok": True, "cache_count": len(load_index()), "version": "v8-search-electronic", "recent_count": len(load_recent_history())}
+
+
+@app.head("/")
+def head_root():
+    return Response(status_code=200)
 
 
 @app.post("/api/quiz/new")
@@ -834,23 +1125,53 @@ def new_quiz(settings: QuizSettings):
             raise HTTPException(status_code=404, detail="条件に合うキャッシュがありません。cache only をOFFにしてください。")
 
     key = get_api_key(settings.api_key)
-    errors = []
+    errors: List[str] = []
     with MPRester(key) as mpr:
-        candidates = search_candidates(mpr, settings)
-        if not candidates:
-            raise HTTPException(status_code=404, detail="条件に合う MP 候補が見つかりませんでした。条件を緩めてください。")
-        for i, mpid in enumerate(candidates[: max(1, settings.max_trials)]):
+        # Multiple independent search rounds greatly reduce intermittent failure.
+        total_trials = max(1, int(settings.max_trials))
+        tried = set()
+        for round_index in range(3):
+            candidates = search_candidates(mpr, settings)
+            if not candidates:
+                errors.append(f"round {round_index+1}: 条件に合う候補がありません")
+                continue
+            for mpid in candidates:
+                if mpid in tried:
+                    continue
+                tried.add(mpid)
+                if len(tried) > total_trials * 3:
+                    break
+                try:
+                    payload = generate_quiz_for_mpid(mpr, mpid, settings)
+                    save_quiz_cache(payload, add_to_index=settings.save_cache)
+                    add_recent_mpid(mpid, settings.recent_limit)
+                    return public_payload(payload)
+                except Exception as exc:
+                    errors.append(f"{mpid}: {exc}")
+                    continue
+    detail = "条件を緩めるか、軌道/電子系フィルタを変更してください。最後の失敗: " + " | ".join(errors[-8:])
+    raise HTTPException(status_code=502, detail=detail)
+
+
+@app.post("/api/quiz/search")
+def quiz_from_search(req: SearchQuizRequest):
+    settings = req.settings
+    key = get_api_key(settings.api_key)
+    errors: List[str] = []
+    with MPRester(key) as mpr:
+        mpids = search_material_ids(mpr, req.query, settings, limit=max(10, int(settings.max_trials)))
+        if not mpids:
+            raise HTTPException(status_code=404, detail="検索条件に合う物質が見つかりませんでした。mp-id、化学式、元素記号、または Fe-O のような化学系で検索してください。")
+        for mpid in mpids:
             try:
                 payload = generate_quiz_for_mpid(mpr, mpid, settings)
-                # Always write a per-session quiz file so /check and /reveal work.
-                # Only add it to the reusable quiz cache index when save_cache=True.
                 save_quiz_cache(payload, add_to_index=settings.save_cache)
                 add_recent_mpid(mpid, settings.recent_limit)
                 return public_payload(payload)
             except Exception as exc:
                 errors.append(f"{mpid}: {exc}")
                 continue
-    raise HTTPException(status_code=500, detail="band/DOS を取得できる候補が見つかりませんでした: " + " | ".join(errors[-5:]))
+    raise HTTPException(status_code=502, detail="検索候補は見つかりましたが、band/DOS の取得または軌道条件で失敗しました: " + " | ".join(errors[-8:]))
 
 
 @app.post("/api/cache/prefetch")
